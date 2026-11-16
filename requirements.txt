@@ -1,0 +1,6 @@
+anthropic>=2.8,<3
+fastapi>=0.163
+uvicorn[standard]>=0.54
+python-multipart>=0.0.30
+pillow>=12
+httpx2>=2.13
