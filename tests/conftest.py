@@ -53,7 +53,7 @@ class FakeCatalog:
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
-    return replace(settings, data_dir=tmp_path, app_password="", ai_price_search=True, auto_ai_price=False)
+    return replace(settings, data_dir=tmp_path, app_password="")
 
 
 @pytest.fixture
@@ -68,25 +68,11 @@ def recognized():
 
 
 @pytest.fixture
-def ai_calls():
-    return []
-
-
-@pytest.fixture
-def client(cfg, fake_catalog, recognized, ai_calls):
+def client(cfg, fake_catalog, recognized):
     def fake_recognize(image_bytes):
         assert image_bytes[:2] == b"\xff\xd8"  # a JPEG was produced
         return Recognition(cards=list(recognized), image_problem="")
 
-    def fake_ai_price(card):
-        ai_calls.append(card["id"])
-        return {
-            "price_eur": 42.0, "price_trend": 42.0, "price_avg": None, "price_low": 35.0, "price_avg30": 40.0,
-            "price_source": "Cardmarket (AI web search)", "price_note": "AI lookup, high confidence",
-            "price_url": "https://www.cardmarket.com/en/Pokemon/Products/Singles/x", "price_updated_at": None,
-        }
-
-    app = create_app(cfg, db=Database(cfg.db_path), catalog=fake_catalog,
-                     recognize=fake_recognize, ai_price=fake_ai_price)
+    app = create_app(cfg, db=Database(cfg.db_path), catalog=fake_catalog, recognize=fake_recognize)
     with TestClient(app) as c:
         yield c

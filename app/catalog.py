@@ -12,7 +12,7 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, quote_plus
 
 import httpx2 as httpx
 
@@ -68,6 +68,12 @@ def extract_cardmarket_price(card: dict, finish: str = "normal") -> dict | None:
         "price_url": None,
         "price_updated_at": cm.get("updated"),
     }
+
+
+def cardmarket_search_url(card: dict) -> str:
+    """A Cardmarket search for the card, to check or set its price by hand."""
+    query = (card.get("name_en") or card.get("name_jp") or "").strip()
+    return f"https://www.cardmarket.com/en/Pokemon/Products/Search?searchString={quote_plus(query)}"
 
 
 def image_url(card: dict) -> str | None:

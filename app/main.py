@@ -14,13 +14,13 @@ import time
 import uuid
 from typing import Callable, Literal
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, Request, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import catalog as catalog_mod
-from . import pricing, recognizer
+from . import recognizer
 from .config import BASE_DIR, Settings, settings as default_settings
 from .db import Database, now_iso
 
@@ -197,14 +197,12 @@ def create_app(
     db: Database | None = None,
     catalog: catalog_mod.Tcgdex | None = None,
     recognize: Callable[[bytes], recognizer.Recognition] | None = None,
-    ai_price: Callable[[dict], dict] | None = None,
 ) -> FastAPI:
     cfg = cfg or default_settings
     cfg.photos_dir.mkdir(parents=True, exist_ok=True)
     db = db or Database(cfg.db_path)
     catalog = catalog or catalog_mod.get_catalog()
     recognize = recognize or recognizer.recognize
-    ai_price = ai_price or pricing.ai_price_lookup
     refresh_job = RefreshJob()
     _remove_orphan_photos(cfg, db)
 
@@ -250,26 +248,29 @@ def create_app(
             "matched": match is not None,
             "catalog_error": catalog_error,
             "duplicate": {"id": dup["id"], "quantity": dup["quantity"]} if dup else None,
-            "cardmarket_search_url": pricing.cardmarket_search_url(card),
+            "cardmarket_search_url": catalog_mod.cardmarket_search_url(card),
         }
 
-    def ai_available() -> bool:
-        return cfg.ai_price_search and cfg.claude_configured
-
-    def run_ai_price(card_id: int) -> None:
-        card = db.get_card(card_id)
-        if not card:
-            return
-        try:
-            db.set_price(card_id, ai_price(card))
-        except pricing.PriceLookupError as exc:
-            db.update_card(card_id, {"price_note": f"AI lookup: {exc}"})
-        except Exception:  # noqa: BLE001 - background task; log and move on
-            log.exception("AI price lookup failed for card %s", card_id)
-
     def with_links(card: dict) -> dict:
-        card["cardmarket_search_url"] = pricing.cardmarket_search_url(card)
+        card["cardmarket_search_url"] = catalog_mod.cardmarket_search_url(card)
         return card
+
+    def link_to_catalog(card: dict) -> dict | None:
+        """Match a card with the catalogue and store the link, image and price. Returns the match."""
+        match = catalog.lookup(name_jp=card["name_jp"], set_code=card["set_code"],
+                               number=card["number"], finish=card["finish"])
+        if not match:
+            return None
+        db.update_card(card["id"], {
+            "tcgdex_id": match["tcgdex_id"],
+            "image_url": match["image_url"],
+            "set_name": match["set_name"],
+            "set_total": card["set_total"] or match["set_total"],
+            "rarity": card["rarity"] or match["rarity"],
+        })
+        if match.get("price"):
+            db.set_price(card["id"], match["price"])
+        return match
 
     # ------------------------------------------------------------- routes
     @app.get("/", include_in_schema=False)
@@ -281,8 +282,6 @@ def create_app(
         return {
             "claude_configured": cfg.claude_configured,
             "model": cfg.claude_model,
-            "ai_price_search": ai_available(),
-            "auto_ai_price": cfg.auto_ai_price and ai_available(),
             "language": cfg.card_language,
             "password_protected": bool(cfg.app_password),
         }
@@ -333,7 +332,7 @@ def create_app(
         return db.stats()
 
     @app.post("/api/cards", status_code=201)
-    def create_card(body: CardCreate, background: BackgroundTasks):
+    def create_card(body: CardCreate):
         data = _clean(body.model_dump(exclude_none=True))
         merge_into = data.pop("merge_into", None)
         if merge_into is not None:
@@ -345,8 +344,6 @@ def create_app(
         if not (data.get("name_jp") or data.get("name_en")):
             raise HTTPException(422, "A card needs at least a Japanese or English name.")
         card = db.create_card(data)
-        if card["price_eur"] is None and cfg.auto_ai_price and ai_available():
-            background.add_task(run_ai_price, card["id"])
         return {"action": "created", "card": with_links(card)}
 
     @app.get("/api/cards/{card_id}")
@@ -379,47 +376,29 @@ def create_app(
     def rematch(card_id: int):
         card = card_or_404(card_id)
         try:
-            match = catalog.lookup(name_jp=card["name_jp"], set_code=card["set_code"],
-                                   number=card["number"], finish=card["finish"])
+            matched = link_to_catalog(card) is not None
         except catalog_mod.CatalogUnavailable as exc:
             raise HTTPException(502, f"Card catalogue unreachable: {exc}") from exc
-        if not match:
-            return {"matched": False, "card": with_links(card)}
-        db.update_card(card_id, {
-            "tcgdex_id": match["tcgdex_id"],
-            "image_url": match["image_url"],
-            "set_name": match["set_name"],
-            "set_total": card["set_total"] or match["set_total"],
-            "rarity": card["rarity"] or match["rarity"],
-        })
-        if match.get("price"):
-            db.set_price(card_id, match["price"])
-        return {"matched": True, "card": with_links(db.get_card(card_id))}
+        return {"matched": matched, "card": with_links(db.get_card(card_id))}
 
     @app.post("/api/cards/{card_id}/price")
-    def refresh_price(card_id: int, method: Literal["auto", "catalog", "ai"] = "auto"):
+    def refresh_price(card_id: int):
+        """Fetch the latest Cardmarket price from the catalogue (linking the card first if needed)."""
         card = card_or_404(card_id)
-        message = ""
-        if method in ("auto", "catalog") and card.get("tcgdex_id"):
-            try:
-                price = catalog.price_for(card["tcgdex_id"], card["finish"])
-            except catalog_mod.CatalogUnavailable as exc:
-                price, message = None, f"Card catalogue unreachable: {exc}"
-            if price:
-                return {"ok": True, "card": with_links(db.set_price(card_id, price))}
-            message = message or "The catalogue has no Cardmarket price for this card."
-        elif method == "catalog":
-            message = "This card is not linked to the catalogue yet. Try 'Re-match' first."
-        if method in ("auto", "ai"):
-            if not ai_available():
-                message = (message + " " if message else "") + "AI price search is not available (needs ANTHROPIC_API_KEY and AI_PRICE_SEARCH=true)."
-            else:
-                try:
-                    return {"ok": True, "card": with_links(db.set_price(card_id, ai_price(card)))}
-                except pricing.PriceLookupError as exc:
-                    message = str(exc)
-                    db.update_card(card_id, {"price_note": f"AI lookup: {exc}"})
-        return {"ok": False, "message": message.strip(), "card": with_links(db.get_card(card_id))}
+        try:
+            if not card.get("tcgdex_id"):
+                if link_to_catalog(card) is None:
+                    return {"ok": False, "card": with_links(card),
+                            "message": "No catalogue match for this card. Check the set code and number."}
+                card = db.get_card(card_id)
+            price = catalog.price_for(card["tcgdex_id"], card["finish"])
+        except catalog_mod.CatalogUnavailable as exc:
+            return {"ok": False, "card": with_links(card), "message": f"Card catalogue unreachable: {exc}"}
+        if not price:
+            return {"ok": False, "card": with_links(card),
+                    "message": "The catalogue has no Cardmarket price for this card. "
+                               "Check it on Cardmarket and enter it as your price."}
+        return {"ok": True, "card": with_links(db.set_price(card_id, price))}
 
     @app.post("/api/prices/refresh")
     def start_refresh():

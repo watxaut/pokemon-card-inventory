@@ -125,26 +125,36 @@ def test_quantity_and_delete(client, cfg):
     assert not photo.exists()
 
 
-def test_price_refresh_catalog_then_ai(client, fake_catalog, ai_calls):
+def test_price_refresh_records_history(client, fake_catalog):
     card = client.post("/api/cards", json=scan(client).json()["cards"][0]["card"]).json()["card"]
     fake_catalog.price["price_eur"] = 2.25
-    res = client.post(f"/api/cards/{card['id']}/price?method=catalog").json()
+    res = client.post(f"/api/cards/{card['id']}/price").json()
     assert res["ok"] and res["card"]["price_eur"] == 2.25
-
-    res = client.post(f"/api/cards/{card['id']}/price?method=ai").json()
-    assert res["ok"] and res["card"]["price_eur"] == 42.0
-    assert res["card"]["price_source"] == "Cardmarket (AI web search)"
-    assert ai_calls == [card["id"]]
-
     history = client.get(f"/api/cards/{card['id']}").json()["history"]
-    assert [h["price_eur"] for h in history] == [1.5, 2.25, 42.0]
+    assert [h["price_eur"] for h in history] == [1.5, 2.25]
 
 
-def test_auto_price_falls_back_to_ai_for_unlinked_cards(client, ai_calls):
+def test_price_refresh_links_unlinked_card_first(client):
+    card = client.post("/api/cards", json={"name_jp": "ピカチュウ", "set_code": "SV2a", "number": "025"}).json()["card"]
+    assert card["tcgdex_id"] is None
+    res = client.post(f"/api/cards/{card['id']}/price").json()
+    assert res["ok"] and res["card"]["tcgdex_id"] == "SV2a-025" and res["card"]["price_eur"] == 1.5
+
+
+def test_price_refresh_without_catalogue_price_explains_what_to_do(client):
     card = client.post("/api/cards", json={"name_jp": "ミュウ", "name_en": "Mew"}).json()["card"]
     res = client.post(f"/api/cards/{card['id']}/price").json()
-    assert res["ok"] and res["card"]["price_eur"] == 42.0
-    assert ai_calls == [card["id"]]
+    assert res["ok"] is False and "set code" in res["message"]
+
+
+def test_manual_price_entered_when_adding(client):
+    card = client.post("/api/cards", json={"name_jp": "ミュウ", "manual_price": 4.2}).json()["card"]
+    assert card["value"] == 4.2 and card["price_eur"] is None
+
+
+def test_ai_price_search_is_gone(client):
+    assert "ai_price_search" not in client.get("/api/status").json()
+    assert all("ai" not in route.path.split("/") for route in client.app.routes)
 
 
 def test_rematch_links_card_after_fixing_number(client):
@@ -189,8 +199,7 @@ def test_csv_export_has_bom_and_japanese(client):
 
 def test_password_protection(cfg):
     locked = replace(cfg, app_password="s3cret")
-    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(),
-                     recognize=lambda b: None, ai_price=lambda c: {})
+    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(), recognize=lambda b: None)
     with TestClient(app) as c:
         assert c.get("/api/cards").status_code == 401
         assert c.get("/").status_code == 401

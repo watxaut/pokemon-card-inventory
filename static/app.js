@@ -259,6 +259,8 @@ function renderResult(entry) {
           <label class="span-3">Finish<select name="finish">
             ${Object.entries(FINISHES).map(([k, v]) => `<option value="${k}" ${card.finish === k ? "selected" : ""}>${v}</option>`).join("")}
           </select></label>
+          ${price || dup ? "" : `<label class="span-3">Your price (€, optional)<input type="number" name="manual_price"
+              min="0" step="0.01" inputmode="decimal" value="${esc(card.manual_price ?? "")}"></label>`}
         </div>
         <div class="price-line">
           ${price ? `<span class="price">${price}</span><span class="muted small">${esc(card.price_source || "")}</span>`
@@ -279,7 +281,11 @@ function renderResult(entry) {
 
   const readFields = () => {
     $$("input, select", el).forEach((input) => {
-      card[input.name] = input.type === "number" ? Number(input.value || 1) : input.value.trim();
+      if (input.name === "manual_price") {
+        card.manual_price = input.value === "" ? null : Number(input.value);
+      } else {
+        card[input.name] = input.type === "number" ? Number(input.value || 1) : input.value.trim();
+      }
     });
   };
 
@@ -405,7 +411,7 @@ async function refreshAllPrices() {
     }
     $("#refresh-status").textContent =
       `Prices updated for ${s.updated} card${s.updated === 1 ? "" : "s"}` +
-      (s.no_price ? ` · ${s.no_price} without a catalogue price (open a card and try “Search Cardmarket (AI)”)` : "") +
+      (s.no_price ? ` · ${s.no_price} without a catalogue price (open the card, check Cardmarket and enter your price)` : "") +
       (s.message ? ` · ${s.message}` : "");
     loadCollection();
   } catch (e) {
@@ -433,7 +439,6 @@ function renderDetail(card) {
   const body = $("#detail-body");
   const market = money(card.price_eur);
   const value = money(card.value);
-  const aiOn = state.status && state.status.ai_price_search;
   const photo = card.photo ? `/photos/${encodeURIComponent(card.photo)}` : null;
   const history = (card.history || []).slice().reverse();
 
@@ -464,7 +469,6 @@ function renderDetail(card) {
           ${card.price_updated_at ? `<p class="hint">Updated ${esc(new Date(card.price_updated_at).toLocaleString())}</p>` : ""}
           <div class="actions">
             <button class="btn small" data-act="price-catalog">Update price</button>
-            ${aiOn ? `<button class="btn small" data-act="price-ai">Search Cardmarket (AI)</button>` : ""}
             <a class="btn small ghost" href="${esc(safeUrl(card.cardmarket_url) || safeUrl(card.price_url) || card.cardmarket_search_url)}" target="_blank" rel="noopener">Open Cardmarket ↗</a>
           </div>
         </div>
@@ -523,9 +527,8 @@ function renderDetail(card) {
         const res = await api(`/api/cards/${card.id}/rematch`, { method: "POST" });
         toast(res.matched ? "Linked to the catalogue." : "No catalogue match. Check set code and number, save, then try again.");
         await openDetail(card.id);
-      } else if (act === "price-catalog" || act === "price-ai") {
-        if (act === "price-ai") btn.textContent = "Searching Cardmarket…";
-        const res = await api(`/api/cards/${card.id}/price?method=${act === "price-ai" ? "ai" : "catalog"}`, { method: "POST" });
+      } else if (act === "price-catalog") {
+        const res = await api(`/api/cards/${card.id}/price`, { method: "POST" });
         if (!res.ok) toast(res.message || "No price found.", { error: true, timeout: 9000 });
         else toast(`Price: ${money(res.card.price_eur)}`);
         await openDetail(card.id);

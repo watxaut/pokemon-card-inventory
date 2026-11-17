@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import socket
 
 import uvicorn
@@ -28,9 +29,20 @@ def lan_ip() -> str | None:
         sock.close()
 
 
+def on_android() -> bool:
+    """True inside Termux on an Android phone."""
+    return bool(os.environ.get("TERMUX_VERSION")) or "com.termux" in os.environ.get("PREFIX", "")
+
+
 def main() -> None:
+    android = on_android()
     parser = argparse.ArgumentParser(description="Run the Pokémon card inventory app.")
-    parser.add_argument("--host", default="0.0.0.0", help="0.0.0.0 = reachable from your phone on the same Wi-Fi")
+    parser.add_argument(
+        "--host",
+        # On the phone itself, only the phone can connect unless you ask otherwise.
+        default="127.0.0.1" if android else "0.0.0.0",
+        help="127.0.0.1 = this device only; 0.0.0.0 = also reachable from other devices on the same Wi-Fi",
+    )
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--ssl-certfile", help="certificate for HTTPS (e.g. made with mkcert)")
     parser.add_argument("--ssl-keyfile", help="private key for HTTPS")
@@ -39,10 +51,14 @@ def main() -> None:
 
     scheme = "https" if args.ssl_certfile else "http"
     print("\n  Card Binder")
-    print(f"  This computer:  {scheme}://localhost:{args.port}")
+    print(f"  This device:    {scheme}://localhost:{args.port}")
     ip = lan_ip()
     if ip and args.host == "0.0.0.0":
-        print(f"  Phone (same Wi-Fi): {scheme}://{ip}:{args.port}")
+        print(f"  Other devices (same Wi-Fi): {scheme}://{ip}:{args.port}")
+        if android and not settings.app_password:
+            print("  ! Anyone on this Wi-Fi can open the app. Set APP_PASSWORD in .env, or drop --host 0.0.0.0.")
+    elif android:
+        print("  Only this phone can open it (use --host 0.0.0.0 to share on your Wi-Fi).")
     print(f"  Data folder:    {settings.data_dir}")
     if not settings.claude_configured:
         print("\n  ! ANTHROPIC_API_KEY is not set: card recognition is disabled until you add it to .env")

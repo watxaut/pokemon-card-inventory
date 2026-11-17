@@ -23,13 +23,6 @@ def _load_dotenv(path: Path) -> None:
             os.environ[key] = value
 
 
-def _bool(name: str, default: bool) -> bool:
-    value = os.getenv(name)
-    if value is None or value.strip() == "":
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
@@ -38,8 +31,6 @@ class Settings:
     app_password: str
     tcgdex_base_url: str
     card_language: str
-    ai_price_search: bool
-    auto_ai_price: bool
 
     @property
     def db_path(self) -> Path:
@@ -66,8 +57,6 @@ def load_settings() -> Settings:
         app_password=os.getenv("APP_PASSWORD") or "",
         tcgdex_base_url=(os.getenv("TCGDEX_BASE_URL") or "https://api.tcgdex.net/v2").rstrip("/"),
         card_language=os.getenv("CARD_LANGUAGE") or "ja",
-        ai_price_search=_bool("AI_PRICE_SEARCH", True),
-        auto_ai_price=_bool("AUTO_AI_PRICE", False),
     )
 
 
