@@ -52,10 +52,22 @@ def test_misread_code_with_wrong_set_size_is_rejected(client, identifiers):
     assert scan(client).json()["cards"][0]["matched"] is False
 
 
-def test_scan_keeps_matched_reads_and_drops_misreads(client, identifiers):
-    identifiers[:] = [ident("M6", number="068"), ident("M6", number="058")]
+def test_scan_returns_one_card_the_first_reading_found(client, identifiers):
+    identifiers[:] = [ident("M6", number="068"), ident("M6", number="058"), ident("MEG", "179", "132")]
     cards = scan(client).json()["cards"]
     assert [c["card"]["number"] for c in cards] == ["058"]
+
+
+def test_scan_without_any_match_returns_the_best_reading(client, identifiers):
+    identifiers[:] = [ident("M6", number="068"), ident("M6", number="069")]
+    cards = scan(client).json()["cards"]
+    assert [(c["card"]["number"], c["matched"]) for c in cards] == [("068", False)]
+
+
+def test_straightened_card_flag_is_passed_to_the_reader(client, reads):
+    scan(client)
+    client.post("/api/scan?card=1", files={"file": ("card.jpg", make_jpeg(), "image/jpeg")})
+    assert reads == [False, True]
 
 
 def test_scan_without_identifier_keeps_photo_for_typing(client, cfg, identifiers):
@@ -209,7 +221,7 @@ def test_csv_export_has_bom_and_japanese(client):
 
 def test_password_protection(cfg):
     locked = replace(cfg, app_password="s3cret")
-    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(), read=lambda b: None)
+    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(), read=lambda b, s=False: None)
     with TestClient(app) as c:
         assert c.get("/api/cards").status_code == 401
         assert c.get("/").status_code == 401

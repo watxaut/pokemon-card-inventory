@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PHOTO_SIDE = 1000          # long side of the photo we keep
-MAX_CARDS_PER_PHOTO = 6
+MAX_READS_TO_TRY = 4       # one card per photo; try the best few readings of its code
 
 Finish = Literal["normal", "holo", "reverse_holo", "poke_ball_pattern", "master_ball_pattern"]
 PHOTO_NAME = r"^[0-9a-f]{32}\.jpg$"          # only names this app generated
@@ -216,7 +216,7 @@ def create_app(
     *,
     db: Database | None = None,
     catalog: catalog_mod.Catalog | None = None,
-    read: Callable[[bytes], reader.ReadResult] | None = None,
+    read: Callable[[bytes, bool], reader.ReadResult] | None = None,
 ) -> FastAPI:
     cfg = cfg or default_settings
     cfg.photos_dir.mkdir(parents=True, exist_ok=True)
@@ -313,8 +313,9 @@ def create_app(
         }
 
     @app.post("/api/scan")
-    def scan(file: UploadFile = File(...), set_hint: str = Query(default="", max_length=12)):
-        """Read the identifier(s) in a photo and look the card(s) up."""
+    def scan(file: UploadFile = File(...), set_hint: str = Query(default="", max_length=12),
+             card: bool = Query(default=False, description="the photo is already the straightened card")):
+        """Read the identifier in a photo (one card per photo) and look the card up."""
         raw = file.file.read(MAX_UPLOAD_BYTES + 1)
         if len(raw) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "Photo is too large (max 25 MB).")
@@ -325,7 +326,7 @@ def create_app(
         except reader.ImageError as exc:
             raise HTTPException(400, str(exc)) from exc
         try:
-            result = read(raw)
+            result = read(raw, card)
         except reader.ReaderUnavailable as exc:
             raise HTTPException(503, str(exc)) from exc
 
@@ -333,14 +334,16 @@ def create_app(
         (cfg.photos_dir / photo).write_bytes(result.card_image or photo_bytes)
         hint = set_hint.strip()
         entries = []
-        for ident in result.identifiers[:MAX_CARDS_PER_PHOTO]:
+        for ident in result.identifiers[:MAX_READS_TO_TRY]:  # best reading first
             fields = {"set_code": ident.set_code, "alternatives": ident.alternatives, "number": ident.number,
                       "total": ident.total, "language": ident.language, "rarity": ident.rarity}
             entry = describe(fields, hint)
             entry["read"] = ident.label
             entries.append(entry)
-        # Several reads usually mean misreads of one card: keep the ones found in the catalogue.
-        entries = [e for e in entries if e["matched"]] or entries[:1]
+            if entry["matched"]:
+                break
+        # One card per photo: the first reading found in the catalogue, else the best reading.
+        entries = [next((e for e in entries if e["matched"]), entries[0])] if entries else []
         for entry in entries:
             entry["card"]["photo"] = photo
         problem = "" if entries else (

@@ -69,9 +69,16 @@ def identifiers():
 
 
 @pytest.fixture
-def client(cfg, fake_catalog, identifiers):
-    def fake_read(image_bytes):
+def reads():
+    """The `straightened` flag of every read, in order."""
+    return []
+
+
+@pytest.fixture
+def client(cfg, fake_catalog, identifiers, reads):
+    def fake_read(image_bytes, straightened=False):
         assert image_bytes[:2] == b"\xff\xd8"  # the uploaded JPEG is passed through
+        reads.append(straightened)
         return ReadResult(identifiers=list(identifiers), card_image=None, text="")
 
     app = create_app(cfg, db=Database(cfg.db_path), catalog=fake_catalog, read=fake_read)

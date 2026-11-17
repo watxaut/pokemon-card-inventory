@@ -31,6 +31,8 @@
           <div id="camera" class="camera" hidden>
             <video id="video" playsinline muted autoplay></video>
             <div class="card-guide" aria-hidden="true"></div>
+            <canvas id="overlay" class="overlay" aria-hidden="true"></canvas>
+            <div id="camera-state" class="camera-state" aria-live="polite">Looking for a card…</div>
           </div>
           <p id="camera-hint" class="hint" hidden></p>
 
@@ -48,11 +50,15 @@
           </div>
 
           <label class="switch">
-            <input type="checkbox" id="quick-mode">
-            <span>Quick add: save clearly-read cards straight away (with undo)</span>
+            <input type="checkbox" id="auto-capture" checked>
+            <span>Auto capture: take the photo when the card is detected and held still</span>
           </label>
-          <p class="hint">Tip: one card per photo, upright and filling the frame, with the bottom-left code
-            (e.g. <code>M6 058/076</code>) sharp and free of glare.</p>
+          <label class="switch">
+            <input type="checkbox" id="quick-mode">
+            <span>Quick add: save cards found in the catalogue straight away (with undo)</span>
+          </label>
+          <p class="hint">Tip: one card at a time, on a plain table that contrasts with the card's border. The
+            outlined strip is where the code (e.g. <code>M6 058/076</code>) is read: keep it sharp and free of glare.</p>
 
           <div class="pack-box">
             <label class="pack-set">Set of the packs you're opening
@@ -126,6 +132,7 @@
 
   <div id="toasts" class="toasts" aria-live="polite"></div>
 
+  <script src="/static/card-detector.js" defer></script>
   <script src="/static/app.js" defer></script>
 </body>
 </html>

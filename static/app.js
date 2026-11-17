@@ -163,10 +163,12 @@ async function startCamera() {
   $("#btn-capture").hidden = false;
   $("#btn-capture").disabled = false;
   $("#btn-camera").textContent = "Stop camera";
+  startDetection();
 }
 
 function stopCamera() {
   if (!state.stream) return;
+  stopDetection();
   state.stream.getTracks().forEach((t) => t.stop());
   state.stream = null;
   $("#camera").hidden = true;
@@ -174,13 +176,146 @@ function stopCamera() {
   $("#btn-camera").textContent = "Start camera";
 }
 
-function captureFrame() {
+/* ------------------------------------------------------- live card detection */
+const DETECT_SIZE = 320;   // detection runs on a small copy of each frame
+const live = { timer: null, canvas: null, smooth: null, last: null, still: 0, missed: 0, captured: false };
+
+function startDetection() {
+  Object.assign(live, { smooth: null, last: null, still: 0, missed: 0, captured: false });
+  live.canvas = live.canvas || document.createElement("canvas");
+  const tick = () => {
+    if (!state.stream) return;
+    try { detectFrame(); } catch (e) { console.warn("card detection failed", e); }
+    live.timer = setTimeout(tick, 110);
+  };
+  tick();
+}
+
+function stopDetection() {
+  clearTimeout(live.timer);
+  live.timer = null;
+  drawOverlay(null);
+}
+
+function detectFrame() {
   const video = $("#video");
   if (!video.videoWidth) return;
-  // Keep only the area inside the on-screen card frame (plus a margin), so the card fills the photo.
+  const scale = DETECT_SIZE / Math.max(video.videoWidth, video.videoHeight);
+  const c = live.canvas;
+  c.width = Math.round(video.videoWidth * scale);
+  c.height = Math.round(video.videoHeight * scale);
+  const ctx = c.getContext("2d", { willReadFrequently: true });
+  ctx.drawImage(video, 0, 0, c.width, c.height);
+  const found = CardDetector.detect(ctx.getImageData(0, 0, c.width, c.height));
+  const corners = found ? found.corners.map(([x, y]) => [x / scale, y / scale]) : null;  // video pixels
+  track(corners, Math.hypot(video.videoWidth, video.videoHeight));
+}
+
+function meanDistance(a, b) {
+  return a.reduce((s, p, i) => s + Math.hypot(p[0] - b[i][0], p[1] - b[i][1]), 0) / a.length;
+}
+
+/* Smooth the outline over frames, notice when the card is held still, and auto-capture once. */
+function track(corners, diagonal) {
+  if (!corners) {
+    live.missed += 1;
+    if (live.missed >= 4) Object.assign(live, { smooth: null, last: null, still: 0, captured: false });
+  } else {
+    live.missed = 0;
+    const moved = live.last ? meanDistance(corners, live.last) / diagonal : 1;
+    live.still = moved < 0.012 ? live.still + 1 : 0;
+    if (live.captured && moved > 0.08) live.captured = false;  // moved a lot: probably the next card
+    live.smooth = live.smooth && moved < 0.05
+      ? corners.map((p, i) => [(p[0] + live.smooth[i][0]) / 2, (p[1] + live.smooth[i][1]) / 2])
+      : corners;
+    live.last = corners;
+  }
+  const mode = !live.smooth ? "search" : live.captured ? "done" : live.still >= 6 ? "still" : "moving";
+  const auto = $("#auto-capture").checked;
+  drawOverlay(live.smooth, mode);
+  $("#camera").classList.toggle("has-card", !!live.smooth);
+  $("#camera-state").textContent = {
+    search: "Looking for a card…",
+    moving: "Card found: hold still",
+    still: auto ? "Capturing…" : "Ready: press Capture card",
+    done: "Captured: show the next card",
+  }[mode];
+  if (mode === "still" && auto && !state.busy) captureFrame();
+}
+
+function drawOverlay(corners, mode = "moving") {
+  const canvas = $("#overlay");
+  const video = $("#video");
+  const box = canvas.getBoundingClientRect();
+  const dpr = window.devicePixelRatio || 1;
+  if (canvas.width !== Math.round(box.width * dpr) || canvas.height !== Math.round(box.height * dpr)) {
+    canvas.width = Math.round(box.width * dpr);
+    canvas.height = Math.round(box.height * dpr);
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, box.width, box.height);
+  if (!corners || !video.videoWidth) return;
+  // The video is shown with object-fit: cover, so map video pixels to the visible box.
+  const scale = Math.max(box.width / video.videoWidth, box.height / video.videoHeight);
+  const offX = (video.videoWidth * scale - box.width) / 2;
+  const offY = (video.videoHeight * scale - box.height) / 2;
+  const screen = ([x, y]) => [x * scale - offX, y * scale - offY];
+  const color = { moving: "#f5b301", still: "#22c55e", done: "#60a5fa" }[mode] || "#f5b301";
+  const path = (pts) => {
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => (i ? ctx.lineTo(x, y) : ctx.moveTo(x, y)));
+    ctx.closePath();
+  };
+  path(corners.map(screen));
+  ctx.lineWidth = 3;
+  ctx.lineJoin = "round";
+  ctx.strokeStyle = color;
+  ctx.stroke();
+  // The strip where the set code and number are read.
+  const area = CardDetector.readArea(corners).map(screen);
+  path(area);
+  ctx.fillStyle = color + "40";
+  ctx.fill();
+  ctx.setLineDash([5, 4]);
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+/* Straighten the detected card out of a canvas and return it as a JPEG blob. */
+function straightenedBlob(source, corners) {
+  const [w, h] = CardDetector.cardSize(corners);
+  const pixels = source.getContext("2d").getImageData(0, 0, source.width, source.height);
+  const out = document.createElement("canvas");
+  out.width = w;
+  out.height = h;
+  out.getContext("2d").putImageData(CardDetector.warp(pixels, corners, w, h), 0, 0);
+  return new Promise((resolve) => out.toBlob(resolve, "image/jpeg", 0.92));
+}
+
+async function captureFrame() {
+  const video = $("#video");
+  if (!video.videoWidth) return;
+  const frame = document.createElement("canvas");
+  frame.width = video.videoWidth;
+  frame.height = video.videoHeight;
+  frame.getContext("2d").drawImage(video, 0, 0);
+  const camera = $("#camera");
+  camera.classList.remove("flash");
+  void camera.offsetWidth;  // restart the flash animation
+  camera.classList.add("flash");
+  if (live.smooth) {
+    live.captured = true;
+    // The video is only good enough for the outline; take a full-resolution photo for reading.
+    const sharp = await fullResolutionCard();
+    enqueue([sharp || { blob: await straightenedBlob(frame, live.smooth), straightened: true }]);
+    return;
+  }
+  // No card outline: keep the area inside the on-screen frame (plus a margin).
   const box = video.getBoundingClientRect();
   const guide = $(".card-guide").getBoundingClientRect();
-  const scale = Math.max(box.width / video.videoWidth, box.height / video.videoHeight); // object-fit: cover
+  const scale = Math.max(box.width / video.videoWidth, box.height / video.videoHeight);
   const offX = (video.videoWidth * scale - box.width) / 2;
   const offY = (video.videoHeight * scale - box.height) / 2;
   const margin = 0.08 * guide.height;
@@ -188,16 +323,55 @@ function captureFrame() {
   const sy = Math.max(0, (guide.top - box.top - margin + offY) / scale);
   const sw = Math.min(video.videoWidth - sx, (guide.width + 2 * margin) / scale);
   const sh = Math.min(video.videoHeight - sy, (guide.height + 2 * margin) / scale);
-  const canvas = document.createElement("canvas");
-  canvas.width = Math.round(sw);
-  canvas.height = Math.round(sh);
-  canvas.getContext("2d").drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
-  canvas.toBlob((blob) => enqueue([new File([blob], "capture.jpg", { type: "image/jpeg" })]), "image/jpeg", 0.92);
+  const crop = document.createElement("canvas");
+  crop.width = Math.round(sw);
+  crop.height = Math.round(sh);
+  crop.getContext("2d").drawImage(frame, sx, sy, sw, sh, 0, 0, crop.width, crop.height);
+  crop.toBlob((blob) => enqueue([{ blob, straightened: false }]), "image/jpeg", 0.92);
+}
+
+/* A full-resolution still from the camera (Chrome / Android), with the card found and straightened. */
+async function fullResolutionCard() {
+  const track = state.stream && state.stream.getVideoTracks()[0];
+  if (!track || !("ImageCapture" in window)) return null;
+  try {
+    const item = await prepareUpload(await new ImageCapture(track).takePhoto());
+    return item.straightened ? item : null;
+  } catch (e) {
+    console.info("full-resolution photo not available, using the video frame", e);
+    return null;
+  }
+}
+
+/* For photos taken with the phone camera or uploaded: find the card and straighten it here. */
+async function prepareUpload(file) {
+  try {
+    const bitmap = await createImageBitmap(file);  // applies the photo's EXIF rotation
+    const fit = Math.min(1, 3200 / Math.max(bitmap.width, bitmap.height));
+    const big = document.createElement("canvas");
+    big.width = Math.round(bitmap.width * fit);
+    big.height = Math.round(bitmap.height * fit);
+    big.getContext("2d", { willReadFrequently: true }).drawImage(bitmap, 0, 0, big.width, big.height);
+    const scale = DETECT_SIZE / Math.max(big.width, big.height);
+    const small = document.createElement("canvas");
+    small.width = Math.round(big.width * scale);
+    small.height = Math.round(big.height * scale);
+    const sctx = small.getContext("2d", { willReadFrequently: true });
+    sctx.drawImage(big, 0, 0, small.width, small.height);
+    const found = CardDetector.detect(sctx.getImageData(0, 0, small.width, small.height));
+    if (found) {
+      const corners = found.corners.map(([x, y]) => [x / scale, y / scale]);
+      return { blob: await straightenedBlob(big, corners), straightened: true };
+    }
+  } catch (e) {
+    console.warn("could not look for the card in this photo", e);
+  }
+  return { blob: file, straightened: false };  // let the server look for it
 }
 
 /* ================================================================== scan */
-function enqueue(files) {
-  state.queue.push(...files);
+function enqueue(items) {
+  state.queue.push(...items.map((item) => (item instanceof Blob ? { blob: item, raw: true } : item)));
   if (!state.busy) processQueue();
 }
 
@@ -206,13 +380,19 @@ async function processQueue() {
   let index = 0;
   const total = () => index + state.queue.length;
   while (state.queue.length) {
-    const file = state.queue.shift();
+    let item = state.queue.shift();
     index += 1;
-    setScanStatus(total() > 1 ? `Reading card ${index} of ${total()}…` : "Reading card…", true);
+    const label = total() > 1 ? ` ${index} of ${total()}` : "";
     try {
+      if (item.raw) {
+        setScanStatus(`Finding the card${label}…`, true);
+        item = await prepareUpload(item.blob);
+      }
+      setScanStatus(`Reading card${label}…`, true);
       const form = new FormData();
-      form.append("file", file);
-      const result = await api(`/api/scan?set_hint=${encodeURIComponent(packSet())}`, { method: "POST", body: form });
+      form.append("file", item.blob, "card.jpg");
+      const query = `set_hint=${encodeURIComponent(packSet())}&card=${item.straightened ? 1 : 0}`;
+      const result = await api(`/api/scan?${query}`, { method: "POST", body: form });
       const keepMessage = await handleScanResult(result);
       if (!keepMessage) setScanStatus("");
     } catch (e) {

@@ -12,14 +12,40 @@ with a SQLite file, and it can run on an
 [Android phone](#run-it-on-an-android-phone-termux).
 
 ```
- browser (phone / laptop)                       python run.py (laptop or phone)
-┌──────────────────────┐   photo    ┌──────────────────────────────────────────────┐
-│ Scan · Collection ·  │ ─────────▶ │ OpenCV (optional): find + straighten the card │
-│ Ranking              │            │ Tesseract: read "M6 058/076" bottom-left      │
-│                      │ ◀───────── │ TCGdex: name, image, set, Cardmarket price    │
-└──────────────────────┘   JSON     │ SQLite: data/cards.db + data/photos           │
-                                    └──────────────────────────────────────────────┘
+ browser (phone / laptop)                          python run.py (laptop or phone)
+┌───────────────────────────────┐  card   ┌───────────────────────────────────────────┐
+│ camera: find the card live,   │  image  │ Tesseract: read "M6 058/076" in the        │
+│ outline it, straighten it     │ ──────▶ │   bottom-left strip                        │
+│ Scan · Collection · Ranking   │ ◀────── │ TCGdex: name, image, set, Cardmarket price │
+└───────────────────────────────┘  JSON   │ SQLite: data/cards.db + data/photos        │
+                                          └───────────────────────────────────────────┘
 ```
+
+## How the app finds the card and reads it
+
+1. **Finding the card (in the browser, live).** About 10 times a second, the app takes a
+   small copy of the camera frame and looks for an outline with the shape of a Pokémon
+   card (63 × 88 mm). It finds the edges in the image, joins them into closed shapes, and
+   keeps the one whose size, shape and straight sides match a card. This is classical
+   image processing in plain JavaScript (`static/card-detector.js`): nothing to download,
+   no model to train, and it runs on phones.
+2. **The overlay.** The detected card gets an outline, amber while it moves and green
+   when it is held still. A dashed strip shows the bottom-left area where the code is
+   read. If the card is too cluttered or turned sideways, the app shows no outline rather
+   than a wrong one.
+3. **Capturing.** With **Auto capture** on, the photo is taken once the card is held
+   still for about a second; otherwise press **Capture card**. The video is only
+   sharp enough for the outline, so the app takes a full-resolution photo from the camera
+   when the browser allows it (Chrome and Android; other browsers use the video frame).
+   It then finds the card in that photo, cuts it out and straightens it, which corrects
+   tilt and perspective. **Take photo** and **Upload photos** go through the same detection.
+4. **Reading (on the server).** Tesseract reads only the strip at the bottom left of the
+   straightened card, trying it the other way up if needed. If the browser couldn't find
+   the card, the server looks for it itself (with OpenCV, if installed) or reads the area
+   where the corner usually is.
+5. **Looking it up.** The set code and number find the exact card (next section).
+
+One card per photo: if several codes are read, the first one found in the catalogue wins.
 
 ## How a card is identified
 
@@ -125,9 +151,9 @@ The whole app runs on the phone, with no internet needed except for the card dat
    (`pydantic-core`). **That takes 5–15 minutes.** Keep Termux open and the phone
    plugged in.
 
-   Card detection (OpenCV) is optional on the phone because it is a large download. To
-   include it, run `INSTALL_OPENCV=1 bash termux-setup.sh` instead. Without it, keep the
-   card upright and filling the frame.
+   Card detection happens in the browser, so OpenCV isn't needed on the phone. It only
+   helps photos where the browser didn't find the card; to include it anyway (a large
+   download), run `INSTALL_OPENCV=1 bash termux-setup.sh`.
 4. **Start the app** whenever you want to use it:
    ```bash
    cd ~/pokemon-card-inventory && source .venv/bin/activate && python run.py
@@ -153,10 +179,12 @@ If it still fails, keep the error message to ask for help.
 
 ## Pack-opening workflow
 
-1. Open **Scan**. You can turn on **Quick add**, which saves every card found in the
-   catalogue straight away, with **Undo**.
-2. Photograph the first card. When it is found, its set (e.g. `M6`) fills in **Set of the
-   packs you're opening**.
+1. Open **Scan** and press **Start camera**. Leave **Auto capture** on, and turn on
+   **Quick add** if you want every card found in the catalogue saved straight away (with
+   **Undo**).
+2. Put the first card on the table under the camera and hold still until the outline
+   turns green. When it is found, its set (e.g. `M6`) fills in **Set of the packs you're
+   opening**. Swap in the next card: a new capture happens when the card changes.
 3. For the following cards, the number is usually enough. If the set code is
    unreadable, for example because of glare on a holo card, the pack set is used. If the
    photo can't be read at all, type the number (`058`) and press **Find card**. The photo
@@ -166,9 +194,10 @@ If it still fails, keep the error message to ask for help.
    separate cards; choose the **Finish** before adding.
 5. **This session** lists what you pulled and what it is worth.
 
-**Photo tips:** keep the card upright and filling most of the frame, with the
-bottom-left code sharp. Tilt the card slightly to move glare away from that corner.
-Reading takes about 1–4 seconds on a laptop, and longer on a phone.
+**Photo tips:** use a plain table that contrasts with the card's border, with nothing
+touching the card. Keep it upright (portrait) and large in the frame, with the dashed strip
+sharp. Tilt the card slightly to move glare away from that corner. Reading takes about
+1–4 seconds on a laptop, and longer on a phone.
 
 ## Collection and ranking
 
@@ -194,11 +223,19 @@ Reading takes about 1–4 seconds on a laptop, and longer on a phone.
 
 ## Limits
 
-- **Real cards are untested.** The reader was tuned on drawn cards in simulated photos.
-  On those, it read the number and set size in 55 of 56 photos (tilted, small,
-  blurry, upside down, webcam), with or without OpenCV. English set codes were always
-  read. Japanese set codes printed white-on-black were often misread; the pack set and
-  the set-size check cover that case. Real cards may read better or worse.
+- **Real cards are untested.** Detection and reading were tuned on drawn cards in
+  simulated photos and a simulated camera feed:
+  - **Finding the card:** found in all 7 normal scenes, with corners within 1–2%
+    (upright, tilted, small, rotated 20°, dark or white table, blurry, webcam). It showed
+    no outline for a card cut off by the frame edge, one in heavy clutter, and one turned
+    sideways.
+  - **Reading:** the number and set size in 55 of 56 photos. English set codes were
+    always read. Japanese set codes printed white-on-black were often misread; the pack
+    set and the set-size check cover that case.
+  - **Live video:** a 1080p frame is the minimum for reading; the full-resolution photo
+    is used where the browser allows it.
+
+  Real cards may read better or worse.
 - **New sets** appear in TCGdex shortly after release, and prices later. Until then a
   card is "not matched": add it with a typed name and **Re-match** it later.
 - **Finish** (reverse holo, ball mirror) isn't visible in the code, so you choose it.
@@ -233,20 +270,21 @@ python scripts/build_names.py   # refresh the Japanese→English name list from 
 ```
 app/
   main.py          FastAPI routes, background price refresh, CSV export, password gate
-  reader.py        photo -> card identifier: OpenCV card detection (optional) + Tesseract + parsing
+  reader.py        photo -> card identifier: Tesseract + parsing (+ OpenCV card detection if installed)
   catalog.py       TCGdex: printed set code -> set, card, names, image, Cardmarket price
   names.py         Japanese -> English names (Pokédex number, prefixes/suffixes, items, trainers)
   data/names.json  Pokémon and item names from PokeAPI (BSD-3-Clause)
   db.py            SQLite schema and queries (cards, price history, stats)
   config.py        settings from environment / .env
 static/            single-page UI (plain HTML/CSS/JS, no build step)
+  card-detector.js live card detection, overlay geometry and straightening (no libraries)
 tests/             pytest suite
 run.py             starts the server and prints the addresses to open
 termux-setup.sh    one-time setup on an Android phone (Termux)
 scripts/           build_names.py
 ```
 
-Main endpoints: `POST /api/scan?set_hint=M6` (photo → cards), `POST /api/lookup`
+Main endpoints: `POST /api/scan?set_hint=M6&card=1` (photo or straightened card → card), `POST /api/lookup`
 (set code + number → card), `POST /api/cards`, `GET /api/cards?sort=value|total|newest|name|set&q=`,
 `PATCH/DELETE /api/cards/{id}`, `POST /api/cards/{id}/price`, `POST /api/cards/{id}/rematch`,
 `POST /api/prices/refresh`, `GET /api/stats`, `GET /api/export.csv`.

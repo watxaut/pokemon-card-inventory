@@ -31,7 +31,8 @@ pkg install -y python python-pip python-pillow tesseract rust llvm
 tesseract --version | head -n 1
 
 if [[ "${INSTALL_OPENCV:-0}" == "1" ]]; then
-  # Optional: finds and straightens the card in the photo. Large download (it pulls in Qt and ffmpeg).
+  # Optional: the browser already finds and straightens the card; OpenCV only helps photos where it
+  # couldn't. Large download (it pulls in Qt and ffmpeg).
   echo "    Installing OpenCV for card detection"
   pkg install -y x11-repo
   pkg install -y opencv-python

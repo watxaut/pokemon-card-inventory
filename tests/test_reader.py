@@ -113,3 +113,28 @@ def test_missing_tesseract_raises(monkeypatch):
     monkeypatch.setattr(reader, "tesseract_available", lambda: False)
     with pytest.raises(reader.ReaderUnavailable):
         reader.read_card(drawn_card_photo("MEG EN 179/132"))
+
+
+def straightened_card(identifier: str, upside_down: bool = False) -> bytes:
+    """Just the card, as the browser sends it after detecting and straightening it."""
+    try:
+        font = ImageFont.truetype(FONT, 30)
+    except OSError:
+        pytest.skip("DejaVu font not available")
+    card = Image.new("RGB", (945, 1320), (235, 225, 190))
+    d = ImageDraw.Draw(card)
+    d.rectangle((60, 140, 885, 640), fill=(90, 140, 200))
+    d.text((50, 1235), identifier, font=font, fill=(20, 20, 20))
+    if upside_down:
+        card = card.rotate(180)
+    out = io.BytesIO()
+    card.save(out, format="JPEG", quality=90)
+    return out.getvalue()
+
+
+@needs_tesseract
+@pytest.mark.parametrize("upside_down", [False, True])
+def test_reads_straightened_card_in_either_orientation(upside_down):
+    result = reader.read_card(straightened_card("J  M6  058/076 RR", upside_down), straightened=True)
+    assert [(i.set_code, i.number, i.total) for i in result.identifiers][:1] == [("M6", "058", "076")]
+    assert result.card_image is not None  # saved the right way up

@@ -211,8 +211,12 @@ def _merge(found: list[Identifier]) -> list[Identifier]:
 
 
 # ---------------------------------------------------------------------- reading
-def read_card(image_bytes: bytes) -> ReadResult:
-    """OCR the identifier(s) in a photo. Raises ReaderUnavailable if Tesseract is missing."""
+def read_card(image_bytes: bytes, straightened: bool = False) -> ReadResult:
+    """OCR the identifier in a photo. Raises ReaderUnavailable if Tesseract is missing.
+
+    straightened=True means the image is already just the card, cut out and straightened
+    (the browser does this when it detects the card), so card detection is skipped.
+    """
     if not tesseract_available():
         raise ReaderUnavailable(
             "Text recognition needs Tesseract. Install it (see README: 'Install Tesseract') and restart."
@@ -221,14 +225,18 @@ def read_card(image_bytes: bytes) -> ReadResult:
     texts: list[str] = []
     card_img = None
 
-    card = find_card(img)
+    if straightened:
+        card = img if img.height >= img.width else img.rotate(90, expand=True)
+        card = card.resize(_CARD_SIZE, Image.Resampling.LANCZOS)
+    else:
+        card = find_card(img)
     if card is not None:
         for variant in (card, card.rotate(180)):
             _read_regions(variant, _CARD_REGIONS, texts)
             if parse_identifiers("\n".join(texts)):
                 card_img = variant
                 break
-    if card_img is not None and not _complete(texts):
+    if card_img is not None and not _complete(texts) and not straightened:
         _read_regions(img, _PHOTO_REGIONS[:1], texts)  # a second look for the set code
     if not parse_identifiers("\n".join(texts)):
         # Card not found or unreadable: read where its bottom-left corner usually is, then the

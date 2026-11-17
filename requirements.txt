@@ -4,6 +4,6 @@ python-multipart>=0.0.30
 pillow>=9.1
 httpx2>=2.13
 pytesseract>=0.3.10
-# Optional but recommended on laptops: finds and straightens the card in the photo
-# before reading it. Leave it out on phones (termux-setup.sh skips it).
+# Optional: finds the card in photos the browser couldn't straighten (the browser does
+# this itself for camera captures and uploads). Phones skip it (termux-setup.sh).
 opencv-python-headless>=4.8
