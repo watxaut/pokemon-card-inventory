@@ -204,7 +204,7 @@ def test_manual_price_entered_when_adding(client):
 
 def test_no_claude_anywhere(client):
     status = client.get("/api/status").json()
-    assert set(status) == {"ocr_available", "card_detection", "language", "password_protected"}
+    assert set(status) == {"ocr_available", "card_detection", "name_check", "language", "password_protected"}
 
 
 def test_rematch_links_card_after_fixing_number(client):
@@ -266,3 +266,42 @@ def test_rejects_unsafe_photo_names_and_links(client, cfg):
     ok = client.patch(f"/api/cards/{card['id']}",
                       json={"cardmarket_url": "https://www.cardmarket.com/en/Pokemon/Products/Singles/X"})
     assert ok.status_code == 200
+
+
+
+# ------------------------------------------------------------------ name check
+def test_name_confirms_match(client, title):
+    title[:] = ["ーー メガレックウザex HP"]
+    card = scan(client).json()["cards"][0]
+    assert card["confidence"] == "high" and card["name_check"] == 1.0
+
+
+def test_name_picks_the_alternative_reading(client, identifiers, title, fake_catalog):
+    fake_catalog.CARDS = {**fake_catalog.CARDS, ("M6", "59"): dict(fake_catalog.CARDS[("M6", "58")], tcgdex_id="M6-059",
+                                                                     name_jp="ピカチュウ", name_en="Pikachu", number="059")}
+    identifiers[:] = [ident("M6", number="058"), ident("M6", number="059")]  # 058 read more often...
+    title[:] = ["ーー ピカチュウ"]                                                # ...but the name says Pikachu
+    card = scan(client).json()["cards"][0]
+    assert card["card"]["number"] == "059" and card["confidence"] == "high"
+    assert card["alternatives"] == []  # 058's name contradicts the photo, so it isn't offered
+
+
+def test_name_finds_card_when_number_misread(client, identifiers, title):
+    identifiers[:] = [ident("xx", number="095", total="088")]  # set size misread: no such set
+    title[:] = ["ーーミルホッグ ー"]
+    card = scan(client).json()["cards"][0]
+    assert (card["card"]["set_code"], card["card"]["number"]) == ("M4", "095")  # 095, not the other Watchog print
+    assert card["confidence"] == "check" and card["read"].startswith("name:")
+
+
+def test_name_finds_card_when_nothing_else_read(client, identifiers, title):
+    identifiers.clear()
+    title[:] = ["フォッコ"]
+    card = scan(client).json()["cards"][0]
+    assert (card["card"]["set_code"], card["card"]["number"]) == ("M4", "011")
+
+
+def test_illegible_name_changes_nothing(client, title):
+    title[:] = ["ー 一 |"]
+    card = scan(client).json()["cards"][0]
+    assert card["card"]["number"] == "058" and "name_check" not in card

@@ -47,6 +47,8 @@ python -m pip install -r "${requirements}"
 if command -v termux-wake-unlock > /dev/null; then termux-wake-unlock || true; fi
 rm -f "${requirements}"
 python -c "import fastapi, PIL, pydantic_core, pytesseract, uvicorn; print('    All packages installed.')"
+echo "    Downloading the Japanese model for reading card names (about 14 MB)"
+python scripts/get_jpn_model.py || echo "    Skipped: card names won't be checked. Run 'python scripts/get_jpn_model.py' later."
 
 echo "==> 4/4 Settings"
 if [[ ! -f .env ]]; then

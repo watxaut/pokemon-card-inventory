@@ -23,7 +23,7 @@ import httpx2 as httpx
 
 from .config import settings
 from .db import normalize_number
-from .names import english_name
+from .names import english_name, title_score
 
 log = logging.getLogger(__name__)
 
@@ -300,6 +300,51 @@ class Catalog:
 
     def price_for(self, tcgdex_id: str, finish: str = "normal", language: str = "ja") -> dict | None:
         return self.client("ja" if language == "ja" else "en").price_for(tcgdex_id, finish)
+
+    def sets_with_size(self, total: str) -> list[str]:
+        """Japanese sets whose printed size is `total`."""
+        if not str(total).isdigit():
+            return []
+        return [s["id"] for s in self.client("ja").sets()
+                if str((s.get("cardCount") or {}).get("official") or "") == str(int(total))]
+
+    def recent_sets(self, count: int = 12) -> list[str]:
+        """The newest Japanese sets (TCGdex lists sets oldest first), promos excluded."""
+        sets = [s["id"] for s in self.client("ja").sets() if not s["id"].upper().endswith("-P")]
+        return sets[-count:]
+
+    def find_by_title(self, texts: list[str], set_ids: list[str], numbers: list[str] = (),
+                      finish: str = "normal", min_score: float = 0.75) -> dict | None:
+        """The card in one of `set_ids` whose Japanese name matches the OCR'd title.
+
+        Several prints of the same Pokémon (e.g. a normal and an art rare) are told apart by the
+        number readings, digit by digit. Different names scoring alike count as no match.
+        """
+        tcg = self.client("ja")
+        scored = []
+        for set_id in dict.fromkeys(s for s in set_ids if s):
+            for brief in (tcg.set_detail(set_id) or {}).get("cards", []):
+                score = title_score(brief.get("name", ""), texts)
+                if score >= min_score:
+                    scored.append((score, set_id, brief))
+        if not scored:
+            return None
+        top = max(sc for sc, _, _ in scored)
+        best = [x for x in scored if x[0] >= top - 0.1]
+        if len({x[2].get("name") for x in best}) > 1:
+            return None  # two different cards fit the name about equally
+
+        def closeness(brief: dict) -> int:
+            local = str(brief.get("localId") or "").zfill(3)
+            return max((sum(a == b for a, b in zip(local, str(n).zfill(3))) for n in numbers), default=0)
+
+        score, set_id, brief = max(best, key=lambda x: (closeness(x[2]), x[0]))
+        card = tcg.card(brief["id"])
+        if not card:
+            return None
+        match = to_match(card, finish, "ja")
+        match["set_code"] = set_id
+        return match
 
 
 def to_match(card: dict, finish: str, language: str) -> dict:

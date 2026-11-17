@@ -32,7 +32,7 @@ def test_parse_identifiers(text, expected):
     assert first(text) == expected
 
 
-@pytest.mark.parametrize("text", ["HP 280", "©2026 Pokémon", "999/076", "12/3", "5/1000", ""])
+@pytest.mark.parametrize("text", ["HP 280", "©2026 Pokémon", "999/076", "12/3", "5/1000", "123456/103", ""])
 def test_ignores_things_that_are_not_identifiers(text):
     assert parse_identifiers(text) == []
 
@@ -138,3 +138,15 @@ def test_reads_straightened_card_in_either_orientation(upside_down):
     result = reader.read_card(straightened_card("J  M6  058/076 RR", upside_down), straightened=True)
     assert [(i.set_code, i.number, i.total) for i in result.identifiers][:1] == [("M6", "058", "076")]
     assert result.card_image is not None  # saved the right way up
+
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("095/0837", ["095/083"]),               # 'AR' glued on as a digit
+    ("1095/0837", ["095/083", "109/083"]),   # stray character in front: both splits are candidates
+    ("1497/742", ["497/742", "149/742"]),    # the slash read twice
+    ("911/103", ["011/103"]),                # italic 0 read as 9
+    ("J M6 058/076 RR", ["058/076"]),        # the 6 of M6 stays separate
+])
+def test_parse_fraction_candidates(text, expected):
+    assert reader._parse_fraction(text) == expected

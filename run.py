@@ -64,8 +64,8 @@ def main() -> None:
     if not reader.tesseract_available():
         print("\n  ! Tesseract is not installed: photos can't be read until you install it (see README).")
         print("    You can still type card numbers in.")
-    elif not reader.opencv_available():
-        print("  Card detection (OpenCV) is not installed: fill the frame with the card for best results.")
+    elif not reader.title_available():
+        print("  Card names are not checked: run 'python scripts/get_jpn_model.py' to enable it.")
     if settings.app_password:
         print("  Password protection is ON (APP_PASSWORD).")
     print()

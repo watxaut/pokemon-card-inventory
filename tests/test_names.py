@@ -48,3 +48,13 @@ def test_unknown_names_are_left_blank():
 
 def test_species_name():
     assert species_name(25) == "Pikachu" and species_name(9999) == ""
+
+
+
+def test_title_score_tolerates_ocr_noise():
+    from app.names import title_readable, title_score
+    assert title_score("ミルホッグ", ["ーーミルホツグ ー"]) == 1.0          # small ッ read as ツ, frame lines
+    assert title_score("ホップのウッウ", ["ーッ 7 の 0 ウッ ウ"]) >= 0.5
+    assert title_score("ゼクロム", ["ピカチュウ"]) == 0.0
+    assert title_score("", ["ゼクロム"]) == 0.0
+    assert title_readable(["ゼクロム"]) and not title_readable(["ー 一", "ab 12"])

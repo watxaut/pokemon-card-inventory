@@ -20,6 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import catalog as catalog_mod
+from . import names as names_mod
 from . import reader
 from .config import BASE_DIR, Settings, settings as default_settings
 from .db import Database, now_iso
@@ -304,6 +305,66 @@ def create_app(
             db.set_price(card["id"], match["price"])
         return match
 
+    def entry_for(match: dict, read_label: str) -> dict:
+        card = card_from({"set_code": match["set_code"], "number": match["number"]}, match)
+        dup = db.find_duplicate(tcgdex_id=card["tcgdex_id"], set_code=card["set_code"],
+                                number=card["number"], finish=card["finish"])
+        return {"card": card, "matched": True, "catalog_error": None, "read": read_label,
+                "duplicate": {"id": dup["id"], "quantity": dup["quantity"]} if dup else None,
+                "cardmarket_search_url": catalog_mod.cardmarket_search_url(card), "alternatives": []}
+
+    def check_name(entry: dict | None, title: list[str], readings, hint: str, photo: str) -> dict | None:
+        """Cross-check the match with the card's name read from the photo (Japanese cards).
+
+        - The name matches: the match is confirmed (confident).
+        - An alternative reading's card matches the name instead: swap it in.
+        - Nothing matches but the name is legible: look the name up in the likely sets (the
+          match's set, the pack's set, sets with the printed size), using the number readings
+          to pick between prints of the same Pokémon.
+        """
+        if not title or not names_mod.title_readable(title) or not hasattr(catalog, "find_by_title"):
+            return entry
+        if entry and entry["matched"]:
+            options = [entry["card"], *entry.get("alternatives", [])]
+            scores = [names_mod.title_score(c.get("name_jp", ""), title) for c in options]
+            best = max(range(len(options)), key=lambda i: scores[i])
+            if best > 0 and scores[best] >= 0.6 and scores[best] - scores[0] >= 0.25:
+                alt = options[best]
+                previous = {**entry["card"], "read": entry["read"]}
+                entry = entry_for({k: v for k, v in alt.items() if k not in ("read", "photo")}, alt.get("read", ""))
+                entry["alternatives"] = [previous] + [o for i, o in enumerate(options[1:], 1) if i != best]
+                scores[0] = scores[best]
+            entry["name_check"] = round(scores[0], 2)
+            if scores[0] >= 0.6:
+                entry["confidence"] = "high"
+                # The name confirms it: drop alternatives that are other cards (keep other prints).
+                entry["alternatives"] = [a for a in entry.get("alternatives", [])
+                                         if names_mod.title_score(a.get("name_jp", ""), title) >= 0.6]
+                return entry
+            if scores[0] >= 0.35:
+                return entry  # partly legible: keep the number's answer, still marked for checking
+        sets = []
+        if entry and entry["matched"]:
+            sets.append(entry["card"].get("set_code"))
+        if hint:
+            sets.append(hint)
+        for r in readings:
+            sets += catalog.sets_with_size(r.total)
+        if not sets and hasattr(catalog, "recent_sets"):
+            sets = catalog.recent_sets()  # nothing else to go on: the newest Japanese sets
+        try:
+            match = catalog.find_by_title(title, sets, [r.number for r in readings])
+        except catalog_mod.CatalogUnavailable:
+            return entry
+        if not match:
+            return entry
+        found = entry_for(match, "name: " + (match.get("name_jp") or ""))
+        found["confidence"] = "check"
+        found["name_check"] = round(names_mod.title_score(match.get("name_jp", ""), title), 2)
+        if entry and entry["matched"]:
+            found["alternatives"] = [{**entry["card"], "read": entry["read"]}] + entry.get("alternatives", [])
+        return found
+
     # ------------------------------------------------------------- routes
     @app.get("/", include_in_schema=False)
     def index():
@@ -313,7 +374,8 @@ def create_app(
     def status():
         return {
             "ocr_available": ocr_available(),
-            "card_detection": reader.opencv_available(),
+            "card_detection": True,
+            "name_check": reader.title_available(),
             "language": cfg.card_language,
             "password_protected": bool(cfg.app_password),
         }
@@ -358,6 +420,7 @@ def create_app(
             if chosen is not None:
                 break
         entries = []
+        entry = None
         if readings:
             k = chosen if chosen is not None else 0
             entry = tried.get(k) or describe({"set_code": readings[0].set_code, "number": readings[0].number,
@@ -374,6 +437,8 @@ def create_app(
             runner_up = max((r.hits for j, r in enumerate(readings) if j != k), default=0)
             entry["confidence"] = "high" if entry["matched"] and votes >= 3 and votes - runner_up >= 2 \
                 and not entry["alternatives"] else "check"
+        entry = check_name(entry, result.title, readings, hint, photo)
+        if entry:
             entries = [entry]
         for entry in entries:
             entry["card"]["photo"] = photo

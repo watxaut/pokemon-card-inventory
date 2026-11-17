@@ -122,3 +122,40 @@ def english_name(name_jp: str, dex_ids: list[int] | None = None, category: str =
     if not base:
         return ""
     return f"{owner}{form}{prefix}{base}{xy}{suffix}"
+
+
+# --------------------------------------------------------------- name matching
+_JAPANESE = re.compile(r"[぀-ヿ一-鿿]")
+_SMALL_KANA = str.maketrans("ァィゥェォッャュョヮぁぃぅぇぉっゃゅょゎ", "アイウエオツヤユヨワあいうえおつやゆよわ")
+
+
+def _kana(text: str) -> str:
+    """Japanese letters only, small kana made full size, long-vowel marks dropped (OCR confuses
+    them with frame lines), for comparing a card's name with OCR text."""
+    import unicodedata
+    text = unicodedata.normalize("NFKC", text or "").translate(_SMALL_KANA)
+    return "".join(c for c in text if _JAPANESE.match(c) and c not in "ー一")
+
+
+def _lcs(a: str, b: str) -> int:
+    prev = [0] * (len(b) + 1)
+    for ca in a:
+        cur = [0]
+        for j, cb in enumerate(b):
+            cur.append(prev[j] + 1 if ca == cb else max(prev[j + 1], cur[j]))
+        prev = cur
+    return prev[-1]
+
+
+def title_score(name_jp: str, texts: list[str]) -> float:
+    """How much of the card's Japanese name appears, in order, in any of the OCR'd title texts
+    (0..1). Extra characters in the OCR text don't count against it."""
+    name = _kana(name_jp)
+    if len(name) < 2:
+        return 0.0
+    return max((_lcs(name, _kana(t)) / len(name) for t in texts), default=0.0)
+
+
+def title_readable(texts: list[str]) -> bool:
+    """Whether the OCR'd title has enough Japanese letters to judge a name by."""
+    return any(len(_kana(t)) >= 3 for t in texts)

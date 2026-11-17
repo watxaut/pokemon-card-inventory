@@ -22,9 +22,11 @@ import io
 import logging
 import re
 import shutil
+import time
 from collections import Counter
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from functools import lru_cache
+from pathlib import Path
 
 from PIL import Image, ImageFilter, ImageOps
 
@@ -88,6 +90,7 @@ class ReadResult:
     identifiers: list[Identifier]
     card_image: bytes | None  # straightened card (JPEG) when the card was found in the photo
     text: str                 # raw OCR text, for troubleshooting
+    title: list[str] = field(default_factory=list)  # OCR'd name area (Japanese), to check the match
 
 
 class ReaderUnavailable(RuntimeError):
@@ -233,12 +236,12 @@ def read_card(image_bytes: bytes, straightened: bool = False) -> ReadResult:
     else:
         card = find_card(img)
     if card is not None:
-        for variant in (card, card.rotate(180)):
-            found = read_strip(_crop(variant, _CARD_REGIONS[0]), texts)
+        for variant, budget in ((card, 12.0), (card.rotate(180), 5.0)):
+            found = read_strip(_crop(variant, _CARD_REGIONS[0]), texts, budget)
             if found:
                 card_img = variant
                 break
-    if not found:
+    if not found and card is None:
         # Card not found or unreadable: read where its bottom-left corner usually is, then the
         # whole photo, then the photo upside down. Stop at the first region that gives a number.
         for photo, regions in ((img, _PHOTO_REGIONS), (img.rotate(180), _PHOTO_REGIONS[:1])):
@@ -250,12 +253,56 @@ def read_card(image_bytes: bytes, straightened: bool = False) -> ReadResult:
                 break
         found = parse_identifiers("\n".join(texts))
 
+    title_from = card_img if card_img is not None else card
+    title = read_title(title_from) if title_from is not None else []
+
     card_jpeg = None
     if card_img is not None:
         out = io.BytesIO()
         card_img.resize((630, 880), Image.Resampling.LANCZOS).save(out, format="JPEG", quality=88)
         card_jpeg = out.getvalue()
-    return ReadResult(found, card_jpeg, "\n".join(texts))
+    return ReadResult(found, card_jpeg, "\n".join(texts), title)
+
+
+# ------------------------------------------------------------------ card name
+JPN_MODEL_DIR = Path(__file__).resolve().parent.parent / "tessdata"  # scripts/get_jpn_model.py
+
+
+@lru_cache(maxsize=1)
+def _jpn_config() -> str | None:
+    """Tesseract options for Japanese: the accurate model if downloaded, else an installed one."""
+    if (JPN_MODEL_DIR / "jpn.traineddata").is_file():
+        return f'--tessdata-dir "{JPN_MODEL_DIR}"'
+    try:
+        if "jpn" in pytesseract.get_languages(config=""):
+            return ""
+    except Exception:  # noqa: BLE001 - no tesseract, odd install
+        pass
+    return None
+
+
+def title_available() -> bool:
+    return tesseract_available() and _jpn_config() is not None
+
+
+def read_title(card: Image.Image) -> list[str]:
+    """OCR the name area of a straightened card (Japanese). A few overlapping bands are read,
+    since a slightly-off outline moves the name; the texts are compared with candidate names."""
+    config = _jpn_config() if tesseract_available() else None
+    if config is None:
+        return []
+    out = []
+    for y0 in (-0.02, 0.0, 0.02, 0.04):  # card coordinates; the name sits at about 0.03-0.09
+        region = tuple(min(1.0, max(0.0, (v + CARD_PAD) / (1 + 2 * CARD_PAD))) for v in (0.08, y0, 0.78, y0 + 0.075))
+        g = ImageOps.autocontrast(ImageOps.grayscale(_crop(card, region)), cutoff=1)
+        for v in (g, ImageOps.invert(g)):
+            try:
+                text = pytesseract.image_to_string(v, lang="jpn", config=f"--oem 1 --psm 7 {config}").strip()
+            except pytesseract.TesseractError:  # pragma: no cover
+                continue
+            if text:
+                out.append(text)
+    return out
 
 
 # ------------------------------------------------------- focused strip reading
@@ -265,7 +312,7 @@ _NUMBER_WHITELIST = "-c tessedit_char_whitelist=0123456789/"
 _CODE_WHITELIST = "-c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-"
 
 
-def read_strip(strip: Image.Image, texts: list[str]) -> list[Identifier]:
+def read_strip(strip: Image.Image, texts: list[str], budget: float = 12.0) -> list[Identifier]:
     """Read the identifier in the bottom-left strip of a straightened card.
 
     Votes for the number ('050/103') are pooled until one reading clearly leads:
@@ -276,6 +323,7 @@ def read_strip(strip: Image.Image, texts: list[str]) -> list[Identifier]:
     Then the set code is read just left of the best box and the rarity just right of it.
     Falls back to parsing the strip's plain OCR text.
     """
+    deadline = time.monotonic() + budget
     gray = ImageOps.autocontrast(ImageOps.grayscale(strip), cutoff=1)
     words = _words(gray)
     plain = " ".join(w[0] for w in words)
@@ -287,26 +335,31 @@ def read_strip(strip: Image.Image, texts: list[str]) -> list[Identifier]:
         top = pooled.most_common(2)
         return bool(top) and top[0][1] >= 3 and (len(top) == 1 or top[0][1] - top[1][1] >= 2)
 
-    for stage in ("plain", "flat"):
-        if stage == "flat":
-            flat_words = _words(_flatten(ImageOps.grayscale(strip), 60))
-            texts.append(" ".join(w[0] for w in flat_words))
-            all_words += flat_words
-            stage_words = flat_words
-        else:
-            stage_words = words
-        for box in _number_boxes(stage_words):
-            _, x, y, w, h = box
-            fractions = _vote(strip, (x, y, x + w, y + h), _NUMBER_WHITELIST, _parse_fraction)
-            pooled.update(dict(fractions))
-            if fractions and fractions[0][1] > best_votes:
-                best_box, best_votes = (box, stage_words), fractions[0][1]
-            if strong():
-                break
+    # The three first passes are cheap; their number-like boxes are re-read best first.
+    flat_words = _words(_flatten(ImageOps.grayscale(strip), 60))
+    bright_words = _words(_bright_text(strip, 85))
+    texts += [" ".join(w[0] for w in flat_words), " ".join(w[0] for w in bright_words)]
+    all_words += flat_words + bright_words
+    candidates = []
+    for stage_words in (words, flat_words, bright_words):
+        for box in _number_boxes(stage_words, limit=4):
+            if not any(_overlap(box, other) > 0.6 for other, _ in candidates):
+                candidates.append((box, stage_words))
+    candidates.sort(key=lambda c: _number_likeness(c[0][0]), reverse=True)
+    for box, stage_words in candidates[:6]:
+        if time.monotonic() > deadline:
+            break
+        _, x, y, w, h = box
+        fractions = _vote(strip, (x, y, x + w, y + h), _NUMBER_WHITELIST, _parse_fraction)
+        pooled.update(dict(fractions))
+        if fractions and fractions[0][1] > best_votes:
+            best_box, best_votes = (box, stage_words), fractions[0][1]
         if strong():
             break
     if not strong():
         for region, text_h in _anchor_regions(strip, all_words):
+            if pooled and time.monotonic() > deadline:
+                break
             pooled.update(dict(_vote_block(strip, region, text_h)))
     if not pooled:
         return parse_identifiers(plain)
@@ -323,6 +376,13 @@ def _words(gray: Image.Image) -> list[tuple[str, int, int, int, int]]:
     data = pytesseract.image_to_data(gray, config="--oem 1 --psm 11", output_type=pytesseract.Output.DICT)
     return [(data["text"][i].strip(), data["left"][i], data["top"][i], data["width"][i], data["height"][i])
             for i in range(len(data["text"])) if data["text"][i].strip()]
+
+
+def _bright_text(img: Image.Image, percentile: float) -> Image.Image:
+    """Only the brightest pixels, as black on white: white digits with a dark outline on full-art
+    cards (which neither plain nor inverted images show cleanly)."""
+    a = np.asarray(ImageOps.grayscale(img), dtype=np.float32)
+    return Image.fromarray(((a < np.percentile(a, percentile)) * 255).astype(np.uint8))
 
 
 def _flatten(gray: Image.Image, radius: int) -> Image.Image:
@@ -358,6 +418,20 @@ def _number_boxes(words, limit=5):
     return boxes[:limit]
 
 
+def _number_likeness(text: str) -> float:
+    """How much a word looks like '050/103': a slash and 5-9 mostly digit-like characters."""
+    digitish = sum(c in _DIGITISH_SET for c in text) / max(1, len(text))
+    return digitish + (1.0 if "/" in text else 0) + (0.5 if 5 <= len(text) <= 9 else 0)
+
+
+def _overlap(a, b) -> float:
+    """Intersection over the smaller box, for (text, x, y, w, h) boxes."""
+    ax0, ay0, ax1, ay1 = a[1], a[2], a[1] + a[3], a[2] + a[4]
+    bx0, by0, bx1, by1 = b[1], b[2], b[1] + b[3], b[2] + b[4]
+    iw, ih = max(0, min(ax1, bx1) - max(ax0, bx0)), max(0, min(ay1, by1) - max(ay0, by0))
+    return iw * ih / max(1, min(a[3] * a[4], b[3] * b[4]))
+
+
 def _code_and_rarity(strip: Image.Image, box, words):
     """Set codes (best first), language and rarities around the number's box."""
     _, x, y, w, h = box
@@ -391,8 +465,9 @@ def _anchor_regions(strip: Image.Image, words) -> list[tuple[tuple[int, int, int
     for t, x, y, w, h in words:
         low = t.lower()
         if any(low.startswith(k) or k in low for k in _COPYRIGHT) and y > strip.height * 0.3:
-            regions.append(((max(0, x - int(0.45 * strip.width)), max(0, y - int(3.6 * h)),
-                             max(1, x - int(0.03 * strip.width)), min(strip.height, y + h // 4)), h))
+            for above in (2.6, 4.6):  # the identifier line just above, or a little higher
+                regions.append(((max(0, x - int(0.45 * strip.width)), max(0, y - int(above * h)),
+                                 max(1, x - int(0.03 * strip.width)), min(strip.height, y + h // 4)), h))
             break
     for t, x, y, w, h in words:
         if t.lower().lstrip("|!").startswith(("illus", "ilus", "llus")):
@@ -415,7 +490,7 @@ def _vote_block(strip: Image.Image, region, text_h: int) -> list[tuple[str, int]
         g = ImageOps.autocontrast(crop.resize(size, Image.Resampling.LANCZOS), cutoff=2)
         a = np.asarray(g)
         b = Image.fromarray(((a > _otsu(a)) * 255).astype(np.uint8))
-        for v in (g, b, ImageOps.invert(g)):
+        for v in (g, b, ImageOps.invert(g), _bright_text(g, 85)):
             for value in _parse_fraction(_tess(ImageOps.expand(v, border=20, fill=255), f"--oem 1 --psm 6 {_NUMBER_WHITELIST}")):
                 counts[value] += 1
     return sorted(counts.items(), key=lambda kv: (_full_width(kv[0]), kv[1], len(kv[0])), reverse=True)
@@ -472,20 +547,32 @@ def _read_dark_box(strip: Image.Image, box) -> list[str]:
 
 
 def _parse_fraction(text: str) -> list[str]:
-    m = _FRACTION_ONLY.search(text.replace(" ", ""))
-    if not m:
-        return []
-    number, total = m.groups()
-    if not total.isdigit():
-        return [m.group(0)]  # promo, e.g. 001/M-P
-    if not 10 <= int(total) <= 999:
-        return []
-    if int(number) > 2.2 * int(total) and len(number) == len(total) and number[0] in "9867":
-        # Numbers are zero-padded (011/103); the italic 0 is often read as 9, 8, 6 or 7.
-        number = "0" + number[1:]
-    if int(number) > 2.2 * int(total):
-        return []
-    return [f"{number}/{total}"]
+    """Number/size readings in OCR text. Stray characters glued on either side are common
+    ('1095/0837' for 095/083 AR, '1497/742' for 149/742), so every plausible split is returned
+    and the votes (and the catalogue) decide."""
+    text = re.sub(r"\s*/\s*", "/", text)  # spaces around the slash only ('M6 058/076' keeps its space)
+    promo = re.search(r"(?<!\d)(\d{1,3})/([A-Z]{1,3}-P)", text)
+    if promo:
+        return [promo.group(0)]
+    out = []
+    for m in re.finditer(r"(\d+)/(\d+)", text):
+        before, after = m.groups()
+        if len(after) > 4:
+            continue  # a long digit run is not a set size with a stray character
+        total = after[:3] if len(after) >= 3 else after
+        if len(total) < 2 or not 10 <= int(total) <= 999 or (len(after) == 4 and len(before) < 2):
+            continue
+        width = len(total)
+        numbers = [before[-width:]]
+        if len(before) == width + 1:
+            numbers.append(before[:width])  # the slash read twice, e.g. '1497/742'
+        for number in numbers:
+            if int(number) > 2.2 * int(total) and len(number) == len(total) and number[0] in "9867":
+                # Numbers are zero-padded (011/103); the italic 0 is often read as 9, 8, 6 or 7.
+                number = "0" + number[1:]
+            if int(number) <= 2.2 * int(total):
+                out.append(f"{number}/{total}")
+    return list(dict.fromkeys(out))
 
 
 def _parse_codes(text: str) -> list[str]:
@@ -517,20 +604,23 @@ def _variants(img: Image.Image):
     keep = (lambda im: im) if light_text else ImageOps.invert
     order = [(64, 0, flip), (96, 0, flip), (48, 1, flip), (96, 1, flip), (64, 1, flip), (48, 0, flip),
              (64, 0, keep), (96, 1, keep)]
-    for height, which, polarity in order:
+    for k, (height, which, polarity) in enumerate(order):
         yield ImageOps.expand(polarity(prepared[height][which]), border=24, fill=255)
+        if k == 1:  # white digits with a dark outline (full-art cards)
+            for height2, pct in ((64, 85), (96, 80)):
+                yield ImageOps.expand(_bright_text(prepared[height2][1], pct), border=24, fill=255)
 
 
 def _crops(img: Image.Image, box):
     """The box with a few different margins (left, right, top/bottom) in units of its height."""
     x0, y0, x1, y1 = box
     h = y1 - y0
-    for ml, mr, my in ((0.4, 0.9, 0.3), (0.2, 0.6, 0.1), (0.6, 1.3, 0.45)):
+    for ml, mr, my in ((0.4, 0.9, 0.3), (0.2, 0.6, 0.1), (0.6, 1.3, 0.45), (2.0, 0.9, 0.3)):
         yield img.crop((max(0, x0 - int(ml * h)), max(0, y0 - int(my * h)),
                         min(img.width, x1 + int(mr * h)), min(img.height, y1 + int(my * h))))
 
 
-def _vote(img, box, whitelist, parse, per_crop=6):
+def _vote(img, box, whitelist, parse, per_crop=7):
     """Readings of a box over several crops and preparations, as (value, votes), most votes first.
 
     OCR mistakes can repeat (an italic 3 read as 8 several times), so every reading is kept

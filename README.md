@@ -39,11 +39,22 @@ with a SQLite file, and it can run on an
    when the browser allows it (Chrome and Android; other browsers use the video frame).
    It then finds the card in that photo, cuts it out and straightens it, which corrects
    tilt and perspective. **Take photo** and **Upload photos** go through the same detection.
-4. **Reading (on the server).** Tesseract reads only the strip at the bottom left of the
-   straightened card, trying it the other way up if needed. If the browser couldn't find
-   the card, the server looks for it itself (with OpenCV, if installed) or reads the area
-   where the corner usually is.
-5. **Looking it up.** The set code and number find the exact card (next section).
+4. **Reading (on the server).** Tesseract reads the strip at the bottom left of the
+   straightened card. It finds the number's box, re-reads it several ways (sizes, dark or
+   light text, white digits with a dark outline on full-art cards) and takes the reading
+   most attempts agree on. If the browser couldn't find the card, the server looks for it
+   itself (same method, `app/detect.py`).
+5. **Looking it up.** The set code and number find the exact card (next section). Japanese
+   set codes are printed in a stylised font and often misread, so the **set size** is used
+   too: `103` cards is M6a, `742` is MC, `193` is M2a.
+6. **Checking the name.** The card's name (top left, Japanese) is read and compared with
+   the matched card's name. A match confirms the card. If another reading's card matches
+   instead, that one is used. If nothing matches, the name is looked up in the likely sets,
+   which finds the card even when the number was misread. This needs the Japanese model:
+   `python scripts/get_jpn_model.py` (about 14 MB, done by the Termux setup).
+
+Uncertain reads are marked **Please check the number**, other readings that are also real
+cards are offered as one-tap alternatives, and **Quick add** only saves confident reads.
 
 One card per photo: if several codes are read, the first one found in the catalogue wins.
 
@@ -98,8 +109,10 @@ TCGdex is the source. Japanese cards often have no price there. In that case, ta
 | Windows | Install from the [UB Mannheim builds](https://github.com/UB-Mannheim/tesseract/wiki), then set `TESSERACT_CMD=C:\Program Files\Tesseract-OCR\tesseract.exe` in `.env` if it isn't on your PATH |
 | Android (Termux) | done by `termux-setup.sh` (`pkg install tesseract`) |
 
-Only the English language data is needed: the code on the card uses Latin letters and
-digits, even on Japanese cards.
+The English data (included) reads the code. For the name check on Japanese cards, also run
+`python scripts/get_jpn_model.py` once: it downloads Tesseract's accurate Japanese model into
+`./tessdata` (about 14 MB). The `jpn` language from your package manager works too, but is
+less accurate.
 
 ## Quick start (laptop)
 
@@ -111,6 +124,7 @@ python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 cp .env.example .env               # optional: password, data folder
+python scripts/get_jpn_model.py    # optional: name check for Japanese cards
 python run.py
 ```
 
@@ -151,9 +165,7 @@ The whole app runs on the phone, with no internet needed except for the card dat
    (`pydantic-core`). **That takes 5–15 minutes.** Keep Termux open and the phone
    plugged in.
 
-   Card detection happens in the browser, so OpenCV isn't needed on the phone. It only
-   helps photos where the browser didn't find the card; to include it anyway (a large
-   download), run `INSTALL_OPENCV=1 bash termux-setup.sh`.
+   It also downloads the Japanese model used to check card names (about 14 MB).
 4. **Start the app** whenever you want to use it:
    ```bash
    cd ~/pokemon-card-inventory && source .venv/bin/activate && python run.py
@@ -270,7 +282,8 @@ python scripts/build_names.py   # refresh the Japanese→English name list from 
 ```
 app/
   main.py          FastAPI routes, background price refresh, CSV export, password gate
-  reader.py        photo -> card identifier: Tesseract + parsing (+ OpenCV card detection if installed)
+  reader.py        photo -> card identifier and name: Tesseract, voting, parsing
+  detect.py        finds the card in a photo (lines -> card-shaped outline), numpy only
   catalog.py       TCGdex: printed set code -> set, card, names, image, Cardmarket price
   names.py         Japanese -> English names (Pokédex number, prefixes/suffixes, items, trainers)
   data/names.json  Pokémon and item names from PokeAPI (BSD-3-Clause)
@@ -281,7 +294,7 @@ static/            single-page UI (plain HTML/CSS/JS, no build step)
 tests/             pytest suite
 run.py             starts the server and prints the addresses to open
 termux-setup.sh    one-time setup on an Android phone (Termux)
-scripts/           build_names.py
+scripts/           build_names.py, get_jpn_model.py (Japanese model for the name check)
 ```
 
 Main endpoints: `POST /api/scan?set_hint=M6&card=1` (photo or straightened card → card), `POST /api/lookup`
