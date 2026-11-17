@@ -2,7 +2,7 @@
 # One-time setup for running Card Binder on an Android phone with Termux.
 #
 #   cd ~/pokemon-card-inventory
-#   bash termux-setup.sh                 # add INSTALL_OPENCV=1 in front to also install card detection
+#   bash termux-setup.sh
 #
 # Then start the app any time with:
 #   cd ~/pokemon-card-inventory && source .venv/bin/activate && python run.py
@@ -27,28 +27,21 @@ pkg update -y
 pkg upgrade -y
 
 echo "==> 2/4 Installing Python, Tesseract (text recognition), prebuilt Pillow and the Rust compiler"
-pkg install -y python python-pip python-pillow tesseract rust llvm
+pkg install -y python python-pip python-pillow python-numpy tesseract rust llvm
 tesseract --version | head -n 1
 
-if [[ "${INSTALL_OPENCV:-0}" == "1" ]]; then
-  # Optional: the browser already finds and straightens the card; OpenCV only helps photos where it
-  # couldn't. Large download (it pulls in Qt and ffmpeg).
-  echo "    Installing OpenCV for card detection"
-  pkg install -y x11-repo
-  pkg install -y opencv-python
-fi
 
 echo "==> 3/4 Installing the app's Python packages"
 echo "    pydantic-core is compiled on the phone. This can take 5-15 minutes:"
 echo "    keep Termux open and the phone plugged in."
-# --system-site-packages lets the venv use Termux's prebuilt Pillow, pip (and OpenCV if installed).
+# --system-site-packages lets the venv use Termux's prebuilt Pillow, numpy and pip.
 python -m venv --system-site-packages --without-pip .venv
 # shellcheck disable=SC1091
 source .venv/bin/activate
 ANDROID_API_LEVEL="$(getprop ro.build.version.sdk)"
 export ANDROID_API_LEVEL
 requirements="$(mktemp)"
-grep -v -i '^opencv' requirements.txt > "${requirements}"  # OpenCV comes from pkg (above), never pip
+grep -v -i '^numpy' requirements.txt > "${requirements}"  # numpy comes prebuilt from pkg (above)
 if command -v termux-wake-lock > /dev/null; then termux-wake-lock || true; fi
 python -m pip install -r "${requirements}"
 if command -v termux-wake-unlock > /dev/null; then termux-wake-unlock || true; fi

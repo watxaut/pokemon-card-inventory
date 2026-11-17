@@ -1,263 +1,251 @@
-/* Card detection in the browser, without libraries.
+/* Card detection in the browser, without libraries (same method as app/detect.py).
  *
- * Finds one card-shaped outline (a rectangle with the 63:88 shape of a Pokémon card) in an
- * image, returns its four corners, and can cut the card out straightened. Used for the live
- * camera overlay and to straighten photos before they are sent to the server.
+ * Finds one Pokémon card in an image, returns its four corners, and can cut the card out
+ * straightened (with a small margin). Used for the live camera overlay and to straighten
+ * photos before they are sent to the server.
  *
- * How: grey scale -> blur -> edge strength (Sobel) -> connected edge regions -> for each large
- * region, its convex hull and the smallest rectangle around it -> keep the one whose size and
- * shape match a card -> the hull points nearest that rectangle's corners are the card corners
- * (so a card photographed at an angle gives a true quadrilateral, not a rectangle).
+ * Line-based, like a document scanner, so it copes with busy backgrounds (shelves, grids,
+ * sleeves) where the card's outline touches other edges:
+ *  1. edge strength and direction (Sobel) on a small grey copy;
+ *  2. Hough transform: long straight lines;
+ *  3. two pairs of roughly parallel lines, roughly perpendicular, spaced like a card
+ *     (63 x 88 mm) make a candidate;
+ *  4. each candidate is scored by how much real edge runs along its four sides *between* its
+ *     corners (background lines stop where the card covers them), minus how much the sides
+ *     continue past the corners (a real card's sides end there);
+ *  5. of near-equal candidates nested around the best, the outer one is kept (the card's
+ *     edge rather than a line just inside it).
  */
 "use strict";
 
 (function (root) {
-  const CARD_RATIO = 63 / 88;                      // width / height
-  const READ_AREA = [0.0, 0.86, 0.64, 1.0];        // identifier strip, as fractions of the card
+  const CARD_RATIO = 63 / 88;   // width / height
+  const PAD = 0.06;             // margin kept around a straightened card (must match app/reader.py)
+  // Identifier strip in the straightened, padded card (app/reader.py _CARD_REGIONS) ...
+  const STRIP = [0.0, 0.79, 0.72, 1.0];
+  // ... and the same strip in card coordinates (0..1 inside the card), for the overlay.
+  const READ_AREA = STRIP.map((v) => v * (1 + 2 * PAD) - PAD);
+  const BIN = 5;                // degrees per direction bin
 
-  function gray(img) {
-    const { data, width, height } = img;
-    const out = new Float32Array(width * height);
-    for (let i = 0, j = 0; i < out.length; i++, j += 4) {
-      out[i] = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+  function grayBlur(img) {
+    const { data, width: w, height: h } = img;
+    const g = new Float32Array(w * h);
+    for (let i = 0, j = 0; i < g.length; i++, j += 4) g[i] = 0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2];
+    const k = [1, 4, 6, 4, 1];  // 5-tap binomial blur, separable
+    const tmp = new Float32Array(w * h), out = new Float32Array(w * h);
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let s = 0, n = 0;
+        for (let d = -2; d <= 2; d++) { const xx = x + d; if (xx >= 0 && xx < w) { s += k[d + 2] * g[y * w + xx]; n += k[d + 2]; } }
+        tmp[y * w + x] = s / n;
+      }
+    }
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
+        let s = 0, n = 0;
+        for (let d = -2; d <= 2; d++) { const yy = y + d; if (yy >= 0 && yy < h) { s += k[d + 2] * tmp[yy * w + x]; n += k[d + 2]; } }
+        out[y * w + x] = s / n;
+      }
     }
     return out;
   }
 
-  function boxBlur(src, w, h) {
-    let a = src;
-    let b = new Float32Array(w * h);
-    for (let pass = 0; pass < 2; pass++) {
-      for (let y = 0; y < h; y++) {
-        const y0 = Math.max(0, y - 1), y1 = Math.min(h - 1, y + 1);
-        for (let x = 0; x < w; x++) {
-          const x0 = Math.max(0, x - 1), x1 = Math.min(w - 1, x + 1);
-          let s = 0;
-          for (let yy = y0; yy <= y1; yy++) for (let xx = x0; xx <= x1; xx++) s += a[yy * w + xx];
-          b[y * w + x] = s / ((y1 - y0 + 1) * (x1 - x0 + 1));
-        }
-      }
-      [a, b] = [b, a];
-    }
-    return a;
-  }
-
-  function edgeMap(g, w, h) {
-    const mag = new Float32Array(w * h);
+  /* Edge magnitude, edge-normal direction in degrees [0,180), and the strong-edge threshold. */
+  function edges(g, w, h) {
+    const mag = new Float32Array(w * h), dir = new Float32Array(w * h);
     for (let y = 1; y < h - 1; y++) {
       for (let x = 1; x < w - 1; x++) {
         const i = y * w + x;
         const gx = g[i - w + 1] + 2 * g[i + 1] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - 1] - g[i + w - 1];
         const gy = g[i + w - 1] + 2 * g[i + w] + g[i + w + 1] - g[i - w - 1] - 2 * g[i - w] - g[i - w + 1];
-        mag[i] = Math.abs(gx) + Math.abs(gy);
+        mag[i] = Math.hypot(gx, gy);
+        let a = Math.atan2(gy, gx) * 180 / Math.PI;
+        a = ((a % 180) + 180) % 180;
+        dir[i] = a;
       }
     }
     const sample = [];
-    for (let i = 0; i < mag.length; i += 7) sample.push(mag[i]);
+    for (let i = 0; i < mag.length; i += 5) sample.push(mag[i]);
     sample.sort((p, q) => p - q);
-    const threshold = Math.max(40, sample[Math.floor(sample.length * 0.85)]);
-    const edges = new Uint8Array(w * h);
-    for (let i = 0; i < mag.length; i++) if (mag[i] > threshold) edges[i] = 1;
-    const grown = new Uint8Array(w * h);  // thickened 3x3 to close small gaps in the outline
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
+    const thresh = Math.max(30, sample[Math.floor(sample.length * 0.8)]);
+    return { mag, dir, thresh };
+  }
+
+  const angleDiff = (a, b) => { const d = Math.abs(a - b) % 180; return Math.min(d, 180 - d); };
+
+  /* Strong straight lines as [thetaDeg, rho] with x*cos + y*sin = rho. */
+  function hough(mag, dir, thresh, w, h, maxLines) {
+    const diag = Math.ceil(Math.hypot(w, h)) + 1, cols = 2 * diag + 1;
+    const acc = new Float32Array(180 * cols);
+    const cos = new Float32Array(180), sin = new Float32Array(180);
+    for (let t = 0; t < 180; t++) { cos[t] = Math.cos(t * Math.PI / 180); sin[t] = Math.sin(t * Math.PI / 180); }
+    for (let y = 0; y < h; y++) {
+      for (let x = 0; x < w; x++) {
         const i = y * w + x;
-        if (edges[i] || edges[i - 1] || edges[i + 1] || edges[i - w] || edges[i + w] ||
-            edges[i - w - 1] || edges[i - w + 1] || edges[i + w - 1] || edges[i + w + 1]) grown[i] = 1;
-      }
-    }
-    return { edges, grown };
-  }
-
-  /* Fraction of points along the weakest side of `quad` that lie on an edge. A real card has
-     edges all the way round; an outline that merged with things on the table does not. */
-  function sideSupport(grown, w, h, quad) {
-    let weakest = 1;
-    for (let s = 0; s < 4; s++) {
-      const [ax, ay] = quad[s], [bx, by] = quad[(s + 1) % 4];
-      let hits = 0;
-      const samples = 40;
-      for (let k = 2; k < samples - 2; k++) {  // skip the rounded corners
-        const t = k / samples;
-        const x = Math.round(ax + (bx - ax) * t), y = Math.round(ay + (by - ay) * t);
-        if (x >= 0 && y >= 0 && x < w && y < h && grown[y * w + x]) hits++;
-      }
-      weakest = Math.min(weakest, hits / (samples - 4));
-    }
-    return weakest;
-  }
-
-  /* Large connected edge regions, each reduced to its left/right-most pixel per row. */
-  function regions(edges, w, h, minBoxArea) {
-    const seen = new Uint8Array(w * h);
-    const stack = new Int32Array(w * h);
-    const members = new Int32Array(w * h);
-    const out = [];
-    for (let start = 0; start < w * h; start++) {
-      if (!edges[start] || seen[start]) continue;
-      let sp = 0, n = 0;
-      let x0 = w, x1 = -1, y0 = h, y1 = -1;
-      stack[sp++] = start;
-      seen[start] = 1;
-      while (sp) {
-        const p = stack[--sp];
-        members[n++] = p;
-        const x = p % w, y = (p - x) / w;
-        if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y;
-        for (let dy = -1; dy <= 1; dy++) {
-          const yy = y + dy;
-          if (yy < 0 || yy >= h) continue;
-          for (let dx = -1; dx <= 1; dx++) {
-            const xx = x + dx;
-            if (xx < 0 || xx >= w) continue;
-            const q = yy * w + xx;
-            if (edges[q] && !seen[q]) { seen[q] = 1; stack[sp++] = q; }
-          }
+        if (mag[i] <= thresh) continue;
+        const t0 = Math.round(dir[i]);
+        for (let d = -6; d <= 6; d++) {  // vote only near the pixel's own edge direction
+          const t = ((t0 + d) % 180 + 180) % 180;
+          acc[t * cols + Math.round(x * cos[t] + y * sin[t]) + diag] += 1;
         }
       }
-      if ((x1 - x0) * (y1 - y0) < minBoxArea) continue;
-      const left = new Int32Array(h).fill(w), right = new Int32Array(h).fill(-1);
-      for (let k = 0; k < n; k++) {
-        const x = members[k] % w, y = (members[k] - x) / w;
-        if (x < left[y]) left[y] = x;
-        if (x > right[y]) right[y] = x;
+    }
+    const minVotes = 0.12 * Math.min(w, h);
+    const peaks = [];
+    for (let k = 0; k < acc.length; k++) if (acc[k] >= minVotes) peaks.push(k);
+    peaks.sort((a, b) => acc[b] - acc[a]);
+    const lines = [];
+    for (const k of peaks) {
+      const t = Math.floor(k / cols), r = (k % cols) - diag;
+      const close = lines.some(([lt, lr]) => {
+        const dt = Math.abs(lt - t);
+        if (dt <= 3) return Math.abs(lr - r) <= 3;
+        if (dt >= 177) return Math.abs(lr + r) <= 3;  // the same line seen from the other side
+        return false;
+      });
+      if (close) continue;
+      lines.push([t, r]);
+      if (lines.length >= maxLines) break;
+    }
+    return lines;
+  }
+
+  function intersect(l1, l2) {
+    const a1 = Math.cos(l1[0] * Math.PI / 180), b1 = Math.sin(l1[0] * Math.PI / 180);
+    const a2 = Math.cos(l2[0] * Math.PI / 180), b2 = Math.sin(l2[0] * Math.PI / 180);
+    const det = a1 * b2 - a2 * b1;
+    if (Math.abs(det) < 1e-6) return null;
+    return [(l1[1] * b2 - l2[1] * b1) / det, (a1 * l2[1] - a2 * l1[1]) / det];
+  }
+
+  /* Fraction of points between p and q (t0..t1 of the way) with an edge running along the side. */
+  function support(E, w, h, p, q, samples, t0, t1) {
+    const dx = q[0] - p[0], dy = q[1] - p[1];
+    if (Math.abs(dx) + Math.abs(dy) < 1) return 0;
+    const normal = ((Math.atan2(dx, -dy) * 180 / Math.PI) % 180 + 180) % 180;
+    let hits = 0;
+    for (let k = 0; k < samples; k++) {
+      const t = t0 + (t1 - t0) * (samples === 1 ? 0.5 : k / (samples - 1));
+      const cx = Math.round(p[0] + dx * t), cy = Math.round(p[1] + dy * t);
+      let hit = false;
+      for (let oy = -2; oy <= 2 && !hit; oy++) {
+        const yy = cy + oy;
+        if (yy < 0 || yy >= h) continue;
+        for (let ox = -2; ox <= 2; ox++) {
+          const xx = cx + ox;
+          if (xx < 0 || xx >= w) continue;
+          const i = yy * w + xx;
+          if (E.mag[i] > E.thresh && angleDiff(E.dir[i], normal) < 22) { hit = true; break; }
+        }
       }
-      const points = [];
-      for (let y = y0; y <= y1; y++) if (right[y] >= 0) { points.push([left[y], y]); points.push([right[y], y]); }
-      out.push({ points, box: [x0, y0, x1, y1] });
+      if (hit) hits++;
     }
-    return out;
+    return hits / samples;
   }
 
-  function convexHull(points) {
-    const pts = points.slice().sort((a, b) => a[0] - b[0] || a[1] - b[1]);
-    const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
-    const lower = [], upper = [];
-    for (const p of pts) {
-      while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], p) <= 0) lower.pop();
-      lower.push(p);
-    }
-    for (let i = pts.length - 1; i >= 0; i--) {
-      const p = pts[i];
-      while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], p) <= 0) upper.pop();
-      upper.push(p);
-    }
-    upper.pop(); lower.pop();
-    return lower.concat(upper);
-  }
-
-  function inside(hull, [x, y]) {  // point in convex polygon (either winding)
-    let sign = 0;
-    for (let i = 0; i < hull.length; i++) {
-      const [ax, ay] = hull[i], [bx, by] = hull[(i + 1) % hull.length];
-      const c = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
-      if (c !== 0) {
-        if (sign === 0) sign = Math.sign(c);
-        else if (Math.sign(c) !== sign) return false;
-      }
-    }
-    return true;
-  }
-
-  function polygonArea(poly) {
+  function polygonArea(pts) {
     let s = 0;
-    for (let i = 0; i < poly.length; i++) {
-      const [x1, y1] = poly[i], [x2, y2] = poly[(i + 1) % poly.length];
+    for (let i = 0; i < pts.length; i++) {
+      const [x1, y1] = pts[i], [x2, y2] = pts[(i + 1) % pts.length];
       s += x1 * y2 - x2 * y1;
     }
     return Math.abs(s) / 2;
   }
 
-  /* Smallest rectangle around a convex polygon (rotating one side onto each hull edge). */
-  function minAreaRect(hull) {
-    let best = null;
-    for (let i = 0; i < hull.length; i++) {
-      const [ax, ay] = hull[i], [bx, by] = hull[(i + 1) % hull.length];
-      const len = Math.hypot(bx - ax, by - ay);
-      if (!len) continue;
-      const ux = (bx - ax) / len, uy = (by - ay) / len, vx = -uy, vy = ux;
-      let minU = Infinity, maxU = -Infinity, minV = Infinity, maxV = -Infinity;
-      for (const [x, y] of hull) {
-        const u = x * ux + y * uy, v = x * vx + y * vy;
-        if (u < minU) minU = u; if (u > maxU) maxU = u;
-        if (v < minV) minV = v; if (v > maxV) maxV = v;
-      }
-      const area = (maxU - minU) * (maxV - minV);
-      if (!best || area < best.area) {
-        const corner = (u, v) => [u * ux + v * vx, u * uy + v * vy];
-        best = { area, sides: [maxU - minU, maxV - minV],
-                 corners: [corner(minU, minV), corner(maxU, minV), corner(maxU, maxV), corner(minU, maxV)] };
-      }
+  function inside(quad, [x, y], tol = 2) {
+    let sign = 0;
+    for (let k = 0; k < 4; k++) {
+      const [ax, ay] = quad[k], [bx, by] = quad[(k + 1) % 4];
+      const cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+      if (Math.abs(cross) / (Math.hypot(bx - ax, by - ay) || 1) <= tol) continue;
+      if (sign === 0) sign = Math.sign(cross);
+      else if (Math.sign(cross) !== sign) return false;
     }
-    return best;
+    return true;
   }
 
   /* Order four corners as top-left, top-right, bottom-right, bottom-left of an upright card. */
   function orderCorners(c) {
     const d = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
-    // Rotate so that side 0-1 is a short side.
     let pts = d(c[0], c[1]) <= d(c[1], c[2]) ? c.slice() : [c[1], c[2], c[3], c[0]];
-    // Of the two short sides (0-1 and 2-3), the one higher in the image is the top.
     if ((pts[0][1] + pts[1][1]) > (pts[2][1] + pts[3][1])) pts = [pts[2], pts[3], pts[0], pts[1]];
-    // Top-left is the left one of the top side (clockwise order in image coordinates).
     if (pts[0][0] > pts[1][0]) pts = [pts[1], pts[0], pts[3], pts[2]];
     return pts;
   }
 
   /**
-   * Find one card in an ImageData (ideally ~320 px wide).
+   * Find one card in an ImageData (long side ~320-400 px).
    * Returns { corners: [[x,y] x4 tl,tr,br,bl], score } or null.
    */
-  function detect(img, debug = null) {
+  function detect(img, options = {}) {
     const { width: w, height: h } = img;
-    const { edges, grown } = edgeMap(boxBlur(gray(img), w, h), w, h);
-    let best = null;
-    const rejected = [];  // closed shapes that are not a card (used to spot a card's art window)
-    // Thickened edges join a broken outline; thin edges keep the card apart from things touching it.
-    const candidates = regions(grown, w, h, 0.08 * w * h).concat(regions(edges, w, h, 0.08 * w * h));
-    for (const region of candidates) {
-      const [x0, y0, x1, y1] = region.box;
-      if (x0 <= 1 || y0 <= 1 || x1 >= w - 2 || y1 >= h - 2) continue;  // cut off by the frame edge
-      const hull = convexHull(region.points);
-      if (hull.length < 4) continue;
-      const rect = minAreaRect(hull);
-      const [s1, s2] = rect.sides;
-      const ratio = Math.min(s1, s2) / Math.max(s1, s2);
-      const fill = polygonArea(hull) / rect.area;
-      const size = rect.area / (w * h);
-      if (debug) debug.push({ box: region.box, ratio: +ratio.toFixed(3), fill: +fill.toFixed(3), size: +size.toFixed(3) });
-      if (ratio < 0.6 || ratio > 0.82 || fill < 0.85 || size < 0.08 || size > 0.97) {
-        if (size >= 0.08) rejected.push({ hull, area: rect.area });
-        continue;
+    const maxLines = options.maxLines || 80, maxCandidates = options.maxCandidates || 4000;
+    const E = edges(grayBlur(img), w, h);
+    const lines = hough(E.mag, E.dir, E.thresh, w, h, maxLines);
+    if (lines.length < 4) return null;
+
+    // Pairs of roughly parallel lines at least a small card's width apart.
+    const pairs = [];
+    for (let i = 0; i < lines.length; i++) {
+      for (let j = i + 1; j < lines.length; j++) {
+        const [ti, ri] = lines[i], [tj, rj] = lines[j];
+        let dth = Math.abs(ti - tj);
+        const wrap = dth > 90;
+        if (wrap) dth = 180 - dth;
+        if (dth > 14) continue;
+        const sep = Math.abs(wrap ? ri + rj : ri - rj);
+        if (sep < 0.12 * Math.min(w, h)) continue;
+        const mid = wrap ? ((ti + tj + 180) / 2) % 180 : (ti + tj) / 2;
+        pairs.push({ a: lines[i], b: lines[j], sep, mid });
       }
-      // The art window inside a card is landscape and card-shaped too; a card held upright is portrait.
-      const [ra, rb] = [rect.corners[0], rect.corners[1]];
-      const longIsFirst = s1 >= s2;
-      const angle = Math.abs(Math.atan2(rb[1] - ra[1], rb[0] - ra[0]) * 180 / Math.PI) % 180;
-      const longAxisAngle = longIsFirst ? angle : (angle + 90) % 180;
-      const landscape = longAxisAngle < 35 || longAxisAngle > 145;
-      if (landscape && size < 0.3) {
-        rejected.push({ hull, area: rect.area });
-        continue;
+    }
+    // Two pairs, roughly perpendicular, spaced like a card.
+    const combos = [];
+    for (let i = 0; i < pairs.length; i++) {
+      for (let j = i + 1; j < pairs.length; j++) {
+        const P = pairs[i], Q = pairs[j];
+        if (Math.abs(angleDiff(P.mid, Q.mid) - 90) > 18) continue;
+        const ratio = Math.min(P.sep, Q.sep) / Math.max(P.sep, Q.sep);
+        const area = P.sep * Q.sep / (w * h);
+        if (ratio < 0.6 || ratio > 0.85 || area < 0.06 || area > 0.98) continue;
+        combos.push([Math.abs(ratio - CARD_RATIO), P, Q]);
       }
-      const nearest = (p) => hull.reduce((a, q) =>
-        (Math.hypot(q[0] - p[0], q[1] - p[1]) < Math.hypot(a[0] - p[0], a[1] - p[1]) ? q : a));
-      const corners = orderCorners(rect.corners.map(nearest));
-      const support = sideSupport(grown, w, h, corners);
-      if (debug) Object.assign(debug[debug.length - 1], { support: +support.toFixed(3), corners });
-      if (support < 0.6) continue;
-      const score = size * fill * support * (1 - Math.abs(ratio - CARD_RATIO) * 3);
-      if (!best || score > best.score) best = { corners, score, area: rect.area };
     }
-    // Inside a bigger closed shape that failed the card test? Then it is probably the art window
-    // of a card whose outline merged with things on the table: better no outline than a wrong one.
-    if (best && rejected.some((r) => r.area > 1.3 * best.area && best.corners.every((p) => inside(r.hull, p)))) {
-      return null;
+    combos.sort((x, y) => x[0] - y[0]);  // most card-like proportions first
+
+    const candidates = [];
+    for (const [, P, Q] of combos.slice(0, maxCandidates)) {
+      const pts = [intersect(P.a, Q.a), intersect(P.a, Q.b), intersect(P.b, Q.b), intersect(P.b, Q.a)];
+      if (pts.some((p) => !p || p[0] < 2 || p[1] < 2 || p[0] > w - 3 || p[1] > h - 3)) continue;  // whole card in view
+      const side = (k) => Math.hypot(pts[k][0] - pts[(k + 1) % 4][0], pts[k][1] - pts[(k + 1) % 4][1]);
+      const sA = (side(0) + side(2)) / 2, sB = (side(1) + side(3)) / 2;
+      const r = Math.min(sA, sB) / Math.max(sA, sB);
+      if (r < 0.6 || r > 0.85) continue;
+      const sup = [];
+      for (let k = 0; k < 4; k++) {
+        sup.push(support(E, w, h, pts[k], pts[(k + 1) % 4], 32, 0.1, 0.9));
+        if (sup[k] < 0.55) break;
+      }
+      if (sup.length < 4 || Math.min(...sup) < 0.55) continue;
+      let beyond = 0;
+      for (let k = 0; k < 4; k++) {
+        const p = pts[k], q = pts[(k + 1) % 4];
+        beyond += Math.max(support(E, w, h, p, q, 8, -0.12, -0.03), support(E, w, h, p, q, 8, 1.03, 1.12));
+      }
+      const frac = polygonArea(pts) / (w * h);
+      const meanSup = sup.reduce((s, v) => s + v, 0) / 4;
+      const score = (meanSup - 0.5 * beyond / 4) * (1 - 2 * Math.abs(r - CARD_RATIO)) * Math.pow(frac, 0.25);
+      candidates.push({ score, frac, pts });
     }
-    return best && { corners: best.corners, score: best.score };
+    if (!candidates.length) return null;
+    const best = candidates.reduce((a, b) => (b.score > a.score ? b : a));
+    const around = candidates.filter((c) => c.score >= best.score - 0.05 && c.frac > best.frac &&
+      c.frac <= 1.35 * best.frac && best.pts.every((p) => inside(c.pts, p)));
+    const pick = around.length ? around.reduce((a, b) => (b.frac > a.frac ? b : a)) : best;
+    return { corners: orderCorners(pick.pts), score: pick.score };
   }
 
-  /* 3x3 homography mapping 4 points `from` onto 4 points `to`. */
+  /* 3x3 homography (flattened, last = 1) mapping 4 points `from` onto 4 points `to`. */
   function homography(from, to) {
     const A = [], b = [];
     for (let i = 0; i < 4; i++) {
@@ -275,13 +263,13 @@
         b[r] -= f * b[c];
       }
     }
-    const h = new Array(8);
+    const hm = new Array(8);
     for (let r = 7; r >= 0; r--) {
       let s = b[r];
-      for (let k = r + 1; k < 8; k++) s -= A[r][k] * h[k];
-      h[r] = s / A[r][r];
+      for (let k = r + 1; k < 8; k++) s -= A[r][k] * hm[k];
+      hm[r] = s / A[r][r];
     }
-    return [...h, 1];
+    return [...hm, 1];
   }
 
   function project(H, x, y) {
@@ -289,20 +277,24 @@
     return [(H[0] * x + H[1] * y + H[2]) / d, (H[3] * x + H[4] * y + H[5]) / d];
   }
 
-  /* Map points given as fractions of the card (0..1) onto the detected corners. */
-  function cardToImage(corners, fractions) {
+  /* Points given in card coordinates (0..1 inside the card) mapped onto the detected corners. */
+  function cardToImage(corners, points) {
     const H = homography([[0, 0], [1, 0], [1, 1], [0, 1]], corners);
-    return fractions.map(([fx, fy]) => project(H, fx, fy));
+    return points.map(([u, v]) => project(H, u, v));
   }
 
+  /* The identifier strip (where the set code and number are read), as 4 image points. */
   function readArea(corners) {
     const [l, t, r, b] = READ_AREA;
     return cardToImage(corners, [[l, t], [r, t], [r, b], [l, b]]);
   }
 
-  /* Cut the card out of `src` (ImageData) straightened to outW x outH (bilinear sampling). */
+  /* Cut the card out of `src` (ImageData) straightened to outW x outH, including the margin. */
   function warp(src, corners, outW, outH) {
-    const H = homography([[0, 0], [outW - 1, 0], [outW - 1, outH - 1], [0, outH - 1]], corners);
+    const Hc = homography([[0, 0], [1, 0], [1, 1], [0, 1]], corners);
+    const u = (x) => x / (outW - 1) * (1 + 2 * PAD) - PAD, v = (y) => y / (outH - 1) * (1 + 2 * PAD) - PAD;
+    const srcCorners = [[0, 0], [outW - 1, 0], [outW - 1, outH - 1], [0, outH - 1]].map(([x, y]) => project(Hc, u(x), v(y)));
+    const H = homography([[0, 0], [outW - 1, 0], [outW - 1, outH - 1], [0, outH - 1]], srcCorners);
     const out = new ImageData(outW, outH);
     const { data, width, height } = src;
     const o = out.data;
@@ -325,15 +317,15 @@
     return out;
   }
 
-  /* Output size for a straightened card: keep the detail the photo has (between 15 and 30 px/mm). */
+  /* Output size for a straightened card with margin: keep the photo's detail (1320-2640 px tall). */
   function cardSize(corners) {
     const d = (p, q) => Math.hypot(p[0] - q[0], p[1] - q[1]);
-    const tall = Math.max(d(corners[0], corners[3]), d(corners[1], corners[2]));
+    const tall = Math.max(d(corners[0], corners[3]), d(corners[1], corners[2])) * (1 + 2 * PAD);
     const height = Math.round(Math.min(2640, Math.max(1320, tall)));
     return [Math.round(height * CARD_RATIO), height];
   }
 
-  const api = { detect, warp, readArea, cardSize, homography, project, orderCorners, CARD_RATIO, READ_AREA };
+  const api = { detect, warp, readArea, cardSize, homography, project, orderCorners, CARD_RATIO, READ_AREA, PAD };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.CardDetector = api;
 })(typeof window !== "undefined" ? window : globalThis);

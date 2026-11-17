@@ -32,7 +32,7 @@ def test_parse_identifiers(text, expected):
     assert first(text) == expected
 
 
-@pytest.mark.parametrize("text", ["HP 280", "©2026 Pokémon", "920/850", "999/076", "12/3", ""])
+@pytest.mark.parametrize("text", ["HP 280", "©2026 Pokémon", "999/076", "12/3", "5/1000", ""])
 def test_ignores_things_that_are_not_identifiers(text):
     assert parse_identifiers(text) == []
 
@@ -102,8 +102,8 @@ def test_reads_identifier_from_photo(printed, expected):
 
 
 @needs_tesseract
-def test_reads_identifier_without_opencv(monkeypatch):
-    monkeypatch.setattr(reader, "cv2", None)
+def test_photo_without_a_findable_card_falls_back_to_reading_the_corner(monkeypatch):
+    monkeypatch.setattr(reader.detect, "find_card_corners", lambda img: None)
     result = reader.read_card(drawn_card_photo("I  MEG EN  179/132"))
     assert result.card_image is None
     assert (result.identifiers[0].number, result.identifiers[0].total) == ("179", "132")

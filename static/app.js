@@ -206,7 +206,8 @@ function detectFrame() {
   c.height = Math.round(video.videoHeight * scale);
   const ctx = c.getContext("2d", { willReadFrequently: true });
   ctx.drawImage(video, 0, 0, c.width, c.height);
-  const found = CardDetector.detect(ctx.getImageData(0, 0, c.width, c.height));
+  // Lighter settings for the live preview, so it stays smooth on phones.
+  const found = CardDetector.detect(ctx.getImageData(0, 0, c.width, c.height), { maxLines: 60, maxCandidates: 1500 });
   const corners = found ? found.corners.map(([x, y]) => [x / scale, y / scale]) : null;  // video pixels
   track(corners, Math.hypot(video.videoWidth, video.videoHeight));
 }
@@ -291,7 +292,7 @@ function straightenedBlob(source, corners) {
   out.width = w;
   out.height = h;
   out.getContext("2d").putImageData(CardDetector.warp(pixels, corners, w, h), 0, 0);
-  return new Promise((resolve) => out.toBlob(resolve, "image/jpeg", 0.92));
+  return new Promise((resolve) => out.toBlob(resolve, "image/jpeg", 0.95));
 }
 
 async function captureFrame() {
@@ -347,7 +348,7 @@ async function fullResolutionCard() {
 async function prepareUpload(file) {
   try {
     const bitmap = await createImageBitmap(file);  // applies the photo's EXIF rotation
-    const fit = Math.min(1, 3200 / Math.max(bitmap.width, bitmap.height));
+    const fit = Math.min(1, 4096 / Math.max(bitmap.width, bitmap.height));
     const big = document.createElement("canvas");
     big.width = Math.round(bitmap.width * fit);
     big.height = Math.round(bitmap.height * fit);
@@ -418,7 +419,7 @@ async function handleScanResult(result) {
   const quick = $("#quick-mode").checked;
   for (const entry of result.cards.slice().reverse()) {
     if (entry.matched) rememberPackSet(entry.card.set_code);
-    if (quick && entry.matched) {
+    if (quick && entry.matched && entry.confidence === "high") {  // uncertain reads wait for you
       try {
         await saveCard(entry, entry.duplicate ? entry.duplicate.id : null);
         continue;
@@ -480,7 +481,11 @@ function renderResult(entry) {
           ${entry.matched ? `<span class="badge good">Found in catalogue${card.set_name ? `: ${esc(card.set_name)}` : ""}</span>`
                           : `<span class="badge warn">Not matched in catalogue</span>`}
           ${dup ? `<span class="badge accent">You already have ×${dup.quantity}</span>` : ""}
+          ${entry.matched && entry.confidence === "check" ? `<span class="badge warn">Please check the number</span>` : ""}
         </div>
+        ${(entry.alternatives || []).length ? `<div class="alternatives"><span class="muted small">Or is it:</span>
+          ${entry.alternatives.map((a, i) => `<button class="btn small" data-act="alt" data-alt="${i}">
+            ${esc(a.set_code)} ${esc(a.number)} · ${esc(a.name_en || a.name_jp)}</button>`).join("")}</div>` : ""}
         <div class="fields">
           <label class="span-3">Japanese name<input type="text" name="name_jp" lang="ja" value="${esc(card.name_jp)}"></label>
           <label class="span-3">English name<input type="text" name="name_en" value="${esc(card.name_en)}"></label>
@@ -527,6 +532,23 @@ function renderResult(entry) {
     readFields();
     const act = btn.dataset.act;
     if (act === "discard") { el.remove(); return; }
+    if (act === "alt") {  // swap in another reading that is also a real card
+      const alt = entry.alternatives.splice(Number(btn.dataset.alt), 1)[0];
+      const previous = { ...card, read: entry.read };
+      for (const key of Object.keys(card)) if (key.startsWith("price_")) delete card[key];
+      Object.assign(card, alt, { quantity: card.quantity, finish: card.finish });
+      entry.read = alt.read;
+      entry.alternatives.unshift(previous);
+      entry.confidence = "check";
+      try {
+        const fresh = await api("/api/lookup", { method: "POST", json: {
+          set_code: card.set_code, number: card.number, total: card.set_total || "", finish: card.finish } });
+        entry.duplicate = fresh.duplicate;
+        entry.cardmarket_search_url = fresh.cardmarket_search_url;
+      } catch { /* keep what we have */ }
+      draw();
+      return;
+    }
     btn.disabled = true;
     try {
       if (act === "rematch") {

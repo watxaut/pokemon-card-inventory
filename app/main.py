@@ -30,7 +30,7 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
 PHOTO_SIDE = 1000          # long side of the photo we keep
-MAX_READS_TO_TRY = 4       # one card per photo; try the best few readings of its code
+MAX_READS_TO_TRY = 6       # one card per photo; try the best few readings of its code
 
 Finish = Literal["normal", "holo", "reverse_holo", "poke_ball_pattern", "master_ball_pattern"]
 PHOTO_NAME = r"^[0-9a-f]{32}\.jpg$"          # only names this app generated
@@ -254,20 +254,26 @@ def create_app(
             raise HTTPException(404, "Card not found")
         return card
 
-    def describe(read_fields: dict, hint: str = "") -> dict:
+    def describe(read_fields: dict, hint: str = "", by_size: bool = True) -> dict:
         """Look an identifier up and describe the result for the scan screen."""
         match, catalog_error = None, None
-        # The code as read, other readings of it, then the set of the packs being opened.
-        attempts = [(code, True) for code in [read_fields.get("set_code", ""), *read_fields.get("alternatives", ())]]
-        if hint and hint.lower() not in (code.lower() for code, _ in attempts):
-            attempts.append((hint, False))
+        # First pass: the code as read and its other readings, then the set of the packs being opened
+        # (each only if its size matches the printed one). Second pass (by_size): the set identified
+        # by its printed size, and as a last resort the pack's set whatever the printed size.
+        codes = [read_fields.get("set_code", ""), *read_fields.get("alternatives", ())]
+        use_hint = hint and hint.lower() not in (c.lower() for c in codes)
+        attempts = [dict(set_code=c, check_total=True) for c in codes if c]
+        if use_hint:
+            attempts.append(dict(set_code=hint, check_total=True))
+        if by_size:
+            attempts.append(dict(set_code=codes[0], check_total=True, by_size=True))
+            if use_hint:
+                attempts.append(dict(set_code=hint, check_total=False))
         try:
-            for code, from_ocr in attempts:
-                match = catalog.lookup(set_code=code, number=read_fields.get("number", ""),
-                                       total=read_fields.get("total", ""),
+            for attempt in attempts:
+                match = catalog.lookup(number=read_fields.get("number", ""), total=read_fields.get("total", ""),
                                        language=read_fields.get("language", ""),
-                                       finish=read_fields.get("finish") or "normal",
-                                       check_total=from_ocr and len(attempts) > 1)
+                                       finish=read_fields.get("finish") or "normal", **attempt)
                 if match:
                     break
         except catalog_mod.CatalogUnavailable:
@@ -334,16 +340,41 @@ def create_app(
         (cfg.photos_dir / photo).write_bytes(result.card_image or photo_bytes)
         hint = set_hint.strip()
         entries = []
-        for ident in result.identifiers[:MAX_READS_TO_TRY]:  # best reading first
-            fields = {"set_code": ident.set_code, "alternatives": ident.alternatives, "number": ident.number,
-                      "total": ident.total, "language": ident.language, "rarity": ident.rarity}
-            entry = describe(fields, hint)
-            entry["read"] = ident.label
-            entries.append(entry)
-            if entry["matched"]:
+        readings = result.identifiers[:MAX_READS_TO_TRY]  # best reading first
+        # Every reading against its codes and the pack's set first; only then by set size.
+        tried: dict[int, dict] = {}
+        chosen = None
+        for by_size in (False, True):
+            for k, ident in enumerate(readings):
+                if k in tried and tried[k]["matched"]:
+                    continue
+                fields = {"set_code": ident.set_code, "alternatives": ident.alternatives, "number": ident.number,
+                          "total": ident.total, "language": ident.language, "rarity": ident.rarity}
+                entry = describe(fields, hint, by_size)
+                entry["read"] = ident.label
+                tried[k] = entry
+                if entry["matched"] and chosen is None:
+                    chosen = k
+            if chosen is not None:
                 break
-        # One card per photo: the first reading found in the catalogue, else the best reading.
-        entries = [next((e for e in entries if e["matched"]), entries[0])] if entries else []
+        entries = []
+        if readings:
+            k = chosen if chosen is not None else 0
+            entry = tried.get(k) or describe({"set_code": readings[0].set_code, "number": readings[0].number,
+                                              "total": readings[0].total}, hint)
+            # Other readings that are also real cards: offered as one-tap alternatives.
+            seen = {entry["card"].get("tcgdex_id")}
+            entry["alternatives"] = []
+            for j, other in tried.items():
+                card_j = other["card"]
+                if j != k and other["matched"] and card_j["tcgdex_id"] not in seen:
+                    seen.add(card_j["tcgdex_id"])
+                    entry["alternatives"].append({**card_j, "photo": photo, "read": other["read"]})
+            votes = readings[k].hits
+            runner_up = max((r.hits for j, r in enumerate(readings) if j != k), default=0)
+            entry["confidence"] = "high" if entry["matched"] and votes >= 3 and votes - runner_up >= 2 \
+                and not entry["alternatives"] else "check"
+            entries = [entry]
         for entry in entries:
             entry["card"]["photo"] = photo
         problem = "" if entries else (

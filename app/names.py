@@ -24,6 +24,12 @@ _PREFIXES = [
     ("メガ", "Mega "), ("アローラ", "Alolan "), ("ガラル", "Galarian "), ("ヒスイ", "Hisuian "),
     ("パルデア", "Paldean "), ("かがやく", "Radiant "),
 ]
+# Forms written after the Pokémon's name; English puts them in front ("Hearthflame Mask Ogerpon ex").
+_FORMS = {
+    "かまどのめん": "Hearthflame Mask", "いどのめん": "Wellspring Mask", "いしずえのめん": "Cornerstone Mask",
+    "みどりのめん": "Teal Mask", "れいばのすがた": "Ice Rider", "こくばのすがた": "Shadow Rider",
+    "オリジンフォルム": "Origin Forme", "ブラッドムーン": "Bloodmoon",
+}
 # Trainers whose Pokémon appear on cards as "<trainer>の<pokemon>".
 _OWNERS = {
     "N": "N", "リーリエ": "Lillie", "ヒビキ": "Ethan", "カスミ": "Misty", "タケシ": "Brock",
@@ -83,6 +89,11 @@ def english_name(name_jp: str, dex_ids: list[int] | None = None, category: str =
         if rest.endswith(jp) and len(rest) > len(jp):
             rest, suffix = rest[: -len(jp)], en
             break
+    form = ""
+    for jp, en in _FORMS.items():
+        if rest.endswith(jp) and len(rest) > len(jp):
+            rest, form = rest[: -len(jp)].strip(), en + " "
+            break
     owner = ""
     match = re.match(r"^(.+?)の(.+)$", rest)
     if match and match.group(1) in _OWNERS:
@@ -97,11 +108,12 @@ def english_name(name_jp: str, dex_ids: list[int] | None = None, category: str =
         return "", ""
 
     # Whole name first, so メガニウム stays Meganium rather than "Mega" + ニウム.
-    prefix, (base, form) = "", species(rest)
+    rest = rest.strip()
+    prefix, (base, xy) = "", species(rest)
     if not base:
         for jp, en in _PREFIXES:
             if rest.startswith(jp) and len(rest) > len(jp):
-                base, form = species(rest[len(jp):])
+                base, xy = species(rest[len(jp):])
                 if base:
                     prefix = en
                     break
@@ -109,4 +121,4 @@ def english_name(name_jp: str, dex_ids: list[int] | None = None, category: str =
         base = by_dex.get(int(dex_ids[0]), "")
     if not base:
         return ""
-    return f"{owner}{prefix}{base}{form}{suffix}"
+    return f"{owner}{form}{prefix}{base}{xy}{suffix}"

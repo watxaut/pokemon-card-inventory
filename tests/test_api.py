@@ -44,7 +44,26 @@ def test_unreadable_code_falls_back_to_alternative_then_pack_set(client, identif
     identifiers[:] = [ident("", total="078")]  # code unreadable and set size misread
     assert scan(client).json()["cards"][0]["matched"] is False
     assert scan(client, hint="M6").json()["cards"][0]["matched"] is True
-    assert fake_catalog.lookups[-1] == ("M6", "058", "078", False)  # the pack set skips the size check
+    assert fake_catalog.lookups[-1] == ("M6", "058", "078", False, False)  # last resort: pack set, any size
+
+
+def test_unreadable_code_identified_by_set_size(client, identifiers, fake_catalog):
+    identifiers[:] = [ident("ee", total="076")]  # stylised code misread, size read fine
+    card = scan(client).json()["cards"][0]
+    assert card["matched"] is True and card["card"]["set_code"] == "M6"
+    assert fake_catalog.lookups[-1][-1] is True  # found by size
+
+
+def test_pack_set_does_not_override_a_clearly_read_other_set(client, identifiers):
+    identifiers[:] = [ident("xx", number="179", total="132")]  # a MEG card while opening M6 packs
+    card = scan(client, hint="M6").json()["cards"][0]["card"]
+    assert (card["set_code"], card["number"]) == ("MEG", "179")
+
+
+def test_readings_tried_strictly_before_by_size(client, identifiers, fake_catalog):
+    identifiers[:] = [ident("ee", number="179", total="132"), ident("M6", number="058", total="076")]
+    card = scan(client).json()["cards"][0]["card"]
+    assert card["set_code"] == "M6"  # the second reading's exact code beats the first reading's size
 
 
 def test_misread_code_with_wrong_set_size_is_rejected(client, identifiers):

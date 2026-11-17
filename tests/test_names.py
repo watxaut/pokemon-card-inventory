@@ -18,6 +18,10 @@ from app.names import english_name, species_name
     ("ゲンガーVMAX", None, "Gengar VMAX"),
     ("ミュウV", None, "Mew V"),
     ("なぞのポケモンex", [1025], "Pecharunt ex"),       # unknown wording: fall back to the Pokédex number
+    ("オーガポン かまどのめんex", [1017], "Hearthflame Mask Ogerpon ex"),
+    ("オーガポンかまどのめんex", [1017], "Hearthflame Mask Ogerpon ex"),
+    ("ゼクロム", [644], "Zekrom"),
+    ("ディアルガ", [483], "Dialga"),
 ])
 def test_pokemon_names(jp, dex, expected):
     assert english_name(jp, dex) == expected

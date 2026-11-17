@@ -35,7 +35,7 @@ _HOLO_FINISHES = {"reverse_holo", "poke_ball_pattern", "master_ball_pattern"}
 
 # OCR look-alikes, folded together when comparing set codes ('MEG' vs 'MFG', 'M1L' vs 'MIL').
 _SHAPE = str.maketrans({"0": "o", "q": "o", "d": "o", "1": "i", "l": "i", "|": "i", "5": "s",
-                        "8": "b", "2": "z", "6": "g", "f": "e"})
+                        "8": "g", "b": "g", "6": "g", "2": "z", "f": "e"})
 
 
 class CatalogUnavailable(RuntimeError):
@@ -211,8 +211,26 @@ class Tcgdex:
             if scored and scored[0][0] <= 1 and (len(scored) == 1 or scored[1][0] > scored[0][0]
                                                  or scored[1][1] == scored[0][1]):
                 return scored[0][1]
-        if not wanted and len(same_size) == 1:  # code unreadable, but only one set has this size
+        return None
+
+    def find_set_by_size(self, code: str, total: str) -> str | None:
+        """When the code can't be matched: the set with the printed size, the read code breaking ties.
+
+        Set sizes are quite distinctive (M6a has 103 cards, MC 742), and they are printed in plain
+        digits, which OCR reads far more reliably than the stylised set codes.
+        """
+        if not total.isdigit():
+            return None
+        same_size = [s for s in self.sets() if str((s.get("cardCount") or {}).get("official") or "") == str(int(total))]
+        if len(same_size) == 1:
             return same_size[0]["id"]
+        wanted = _shape(code)
+        if len(same_size) < 2 or len(wanted) < 2:
+            return None
+        scored = sorted((min(_distance(wanted, _shape(n)) for n in (s["id"], self.abbreviation(s["id"])) if n), s["id"])
+                        for s in same_size)
+        if scored[0][0] <= max(1, len(wanted) // 2) and scored[1][0] > scored[0][0]:
+            return scored[0][1]
         return None
 
     def card_in_set(self, set_id: str, number: str) -> dict | None:
@@ -248,20 +266,37 @@ class Catalog:
         return [first] + [lang for lang in self.languages if lang != first]
 
     def lookup(self, *, set_code: str = "", number: str = "", total: str = "", language: str = "",
-               finish: str = "normal", check_total: bool = True) -> dict | None:
-        """Find the card for a printed identifier. Returns a match dict or None."""
+               finish: str = "normal", check_total: bool = True, by_size: bool = False) -> dict | None:
+        """Find the card for a printed identifier. Returns a match dict or None.
+
+        by_size: if the set code matches nothing, identify the set from its printed size
+        (the default language first when the card's language wasn't read).
+        """
         if not normalize_number(number):
             return None
         for lang in self._languages_for(language, set_code):
             tcg = self.client(lang)
             set_id = tcg.find_set(set_code, total, check_total)
-            card = tcg.card_in_set(set_id, number) if set_id else None
-            if card:
-                match = to_match(card, finish, lang)
-                # The code as printed on the card: the id for Japanese sets, e.g. 'MEG' for English ones.
-                match["set_code"] = set_id if lang == "ja" else (tcg.abbreviation(set_id) or set_code or set_id)
+            match = self._match(tcg, set_id, number, finish, lang, set_code)
+            if match:
                 return match
+        if by_size:
+            for lang in ([language if language == "ja" else "en"] if language else list(self.languages)):
+                tcg = self.client(lang)
+                match = self._match(tcg, tcg.find_set_by_size(set_code, total), number, finish, lang, set_code)
+                if match:
+                    return match
         return None
+
+    @staticmethod
+    def _match(tcg: "Tcgdex", set_id: str | None, number: str, finish: str, lang: str, read_code: str) -> dict | None:
+        card = tcg.card_in_set(set_id, number) if set_id else None
+        if not card:
+            return None
+        match = to_match(card, finish, lang)
+        # The code as printed on the card: the id for Japanese sets, e.g. 'MEG' for English ones.
+        match["set_code"] = set_id if lang == "ja" else (tcg.abbreviation(set_id) or read_code or set_id)
+        return match
 
     def price_for(self, tcgdex_id: str, finish: str = "normal", language: str = "ja") -> dict | None:
         return self.client("ja" if language == "ja" else "en").price_for(tcgdex_id, finish)
@@ -282,7 +317,7 @@ def to_match(card: dict, finish: str, language: str) -> dict:
         "set_name": s.get("name") or "",
         "set_total": str(total) if total else "",
         "number": str(card.get("localId") or ""),
-        "rarity": card.get("rarity") or "",
+        "rarity": "" if str(card.get("rarity") or "").lower() in ("", "none") else card["rarity"],
         "category": category,
         "image_url": image_url(card),
         "price": extract_cardmarket_price(card, finish),

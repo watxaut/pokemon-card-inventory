@@ -40,9 +40,13 @@ class FakeCatalog:
         }
         self.lookups = []
 
-    def lookup(self, *, set_code="", number="", total="", language="", finish="normal", check_total=True):
-        self.lookups.append((set_code, number, total, check_total))
+    def lookup(self, *, set_code="", number="", total="", language="", finish="normal", check_total=True,
+               by_size=False):
+        self.lookups.append((set_code, number, total, check_total, by_size))
         card = self.CARDS.get((set_code.upper(), number.lstrip("0")))
+        if not card and by_size and total.isdigit():  # identify the set from its printed size
+            card = next((c for (code, n), c in self.CARDS.items()
+                         if n == number.lstrip("0") and int(c["set_total"]) == int(total)), None)
         if not card or (check_total and total.isdigit() and int(total) != int(card["set_total"])):
             return None
         return {**card, "image_url": f"https://assets.tcgdex.net/x/{card['tcgdex_id']}/high.webp",

@@ -109,7 +109,7 @@ You need Python 3.10+ and Tesseract.
 git clone <this repo> && cd pokemon-card-inventory
 python -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt    # includes OpenCV for card detection
+pip install -r requirements.txt
 cp .env.example .env               # optional: password, data folder
 python run.py
 ```
