@@ -14,6 +14,7 @@ import socket
 
 import uvicorn
 
+from app import reader
 from app.config import settings
 
 
@@ -60,8 +61,11 @@ def main() -> None:
     elif android:
         print("  Only this phone can open it (use --host 0.0.0.0 to share on your Wi-Fi).")
     print(f"  Data folder:    {settings.data_dir}")
-    if not settings.claude_configured:
-        print("\n  ! ANTHROPIC_API_KEY is not set: card recognition is disabled until you add it to .env")
+    if not reader.tesseract_available():
+        print("\n  ! Tesseract is not installed: photos can't be read until you install it (see README).")
+        print("    You can still type card numbers in.")
+    elif not reader.opencv_available():
+        print("  Card detection (OpenCV) is not installed: fill the frame with the card for best results.")
     if settings.app_password:
         print("  Password protection is ON (APP_PASSWORD).")
     print()

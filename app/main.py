@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import catalog as catalog_mod
-from . import recognizer
+from . import reader
 from .config import BASE_DIR, Settings, settings as default_settings
 from .db import Database, now_iso
 
@@ -29,8 +29,8 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 
 STATIC_DIR = BASE_DIR / "static"
 MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-CLAUDE_IMAGE_SIDE = 1568   # long side sent to Claude
 PHOTO_SIDE = 1000          # long side of the photo we keep
+MAX_CARDS_PER_PHOTO = 6
 
 Finish = Literal["normal", "holo", "reverse_holo", "poke_ball_pattern", "master_ball_pattern"]
 PHOTO_NAME = r"^[0-9a-f]{32}\.jpg$"          # only names this app generated
@@ -49,7 +49,7 @@ class CardFields(BaseModel):
     rarity: str | None = None
     finish: Finish | None = None
     category: str | None = None
-    language: str | None = None
+    language: str | None = Field(default=None, max_length=5)
     tcgdex_id: str | None = None
     image_url: str | None = Field(default=None, pattern=IMAGE_URL)
     photo: str | None = Field(default=None, pattern=PHOTO_NAME)
@@ -74,10 +74,12 @@ class CardCreate(CardFields):
 
 
 class LookupRequest(BaseModel):
-    name_jp: str = ""
-    name_en: str = ""
-    set_code: str = ""
-    number: str = ""
+    """A typed-in identifier: set code + number (e.g. M6 + 058, or MEG + 179 with total 132)."""
+    set_code: str = Field(default="", max_length=12)
+    number: str = Field(default="", max_length=8)
+    total: str = Field(default="", max_length=8)
+    language: str = Field(default="", max_length=5)
+    rarity: str = Field(default="", max_length=8)
     finish: Finish = "normal"
 
 
@@ -91,33 +93,40 @@ def _clean(fields: dict) -> dict:
     return out
 
 
-def merge_with_match(read: dict, match: dict | None) -> dict:
-    """Combine what Claude read off the card with the catalogue entry."""
+def card_from(read: dict, match: dict | None) -> dict:
+    """Card fields from the identifier (read off the card or typed in) plus the catalogue entry."""
+    total = read.get("total", "")
     card = {
-        "name_jp": read.get("name_jp", ""),
-        "name_en": read.get("name_en", ""),
+        "name_jp": "",
+        "name_en": "",
         "set_code": read.get("set_code", ""),
         "set_name": "",
         "number": read.get("number", ""),
-        "set_total": read.get("set_total", ""),
+        "set_total": total if total.isdigit() else "",
         "rarity": read.get("rarity", ""),
         "finish": read.get("finish") or "normal",
-        "category": read.get("category", ""),
-        "language": "ja",
+        "category": "",
+        "language": read.get("language") or "",
         "tcgdex_id": None,
         "image_url": None,
     }
     if match:
-        card["tcgdex_id"] = match["tcgdex_id"]
-        card["image_url"] = match["image_url"]
-        card["set_name"] = match["set_name"]
-        card["set_code"] = card["set_code"] or match["set_id"]
-        card["number"] = card["number"] or match["number"]
-        card["set_total"] = card["set_total"] or match["set_total"]
-        card["rarity"] = card["rarity"] or match["rarity"]
-        card["name_jp"] = card["name_jp"] or match["name"]
+        card.update({
+            "tcgdex_id": match["tcgdex_id"],
+            "image_url": match["image_url"],
+            "set_name": match["set_name"],
+            "name_jp": match["name_jp"],
+            "name_en": match["name_en"],
+            "category": match["category"],
+            "language": match["language"],
+            "set_code": match.get("set_code") or card["set_code"],
+            "number": match["number"] or card["number"],
+            "set_total": card["set_total"] or match["set_total"],
+            "rarity": card["rarity"] or match["rarity"],
+        })
         if match.get("price"):
             card.update(match["price"])
+    card["language"] = card["language"] or "ja"
     return card
 
 
@@ -133,7 +142,7 @@ class RefreshJob:
         with self._lock:
             return dict(self.state)
 
-    def start(self, db: Database, catalog: catalog_mod.Tcgdex) -> bool:
+    def start(self, db: Database, catalog: catalog_mod.Catalog) -> bool:
         with self._lock:
             if self.state["running"]:
                 return False
@@ -148,22 +157,19 @@ class RefreshJob:
             for key, value in changes.items():
                 self.state[key] = self.state[key] + value if isinstance(value, int) else value
 
-    def _run(self, db: Database, catalog: catalog_mod.Tcgdex, cards: list[dict]):
+    def _run(self, db: Database, catalog: catalog_mod.Catalog, cards: list[dict]):
         try:
             for card in cards:
                 try:
                     tcgdex_id = card.get("tcgdex_id")
                     if not tcgdex_id:
-                        match = catalog.lookup(name_jp=card["name_jp"], set_code=card["set_code"],
-                                               number=card["number"], finish=card["finish"])
+                        match = catalog.lookup(set_code=card["set_code"], number=card["number"],
+                                               total=card["set_total"], language=card["language"],
+                                               finish=card["finish"])
                         if match:
                             tcgdex_id = match["tcgdex_id"]
-                            db.update_card(card["id"], {
-                                "tcgdex_id": tcgdex_id,
-                                "image_url": card.get("image_url") or match["image_url"],
-                                "set_name": card.get("set_name") or match["set_name"],
-                            })
-                    price = catalog.price_for(tcgdex_id, card["finish"]) if tcgdex_id else None
+                            db.update_card(card["id"], link_fields(card, match))
+                    price = catalog.price_for(tcgdex_id, card["finish"], card["language"]) if tcgdex_id else None
                     if price:
                         db.set_price(card["id"], price)
                         self._bump(updated=1)
@@ -181,6 +187,20 @@ class RefreshJob:
             self._bump(running=False, finished_at=now_iso())
 
 
+def link_fields(card: dict, match: dict) -> dict:
+    """Fields to store when an existing card gets linked to its catalogue entry."""
+    return {
+        "tcgdex_id": match["tcgdex_id"],
+        "image_url": match["image_url"],
+        "set_name": match["set_name"],
+        "language": match["language"],
+        "name_jp": card["name_jp"] or match["name_jp"],
+        "name_en": card["name_en"] or match["name_en"],
+        "set_total": card["set_total"] or match["set_total"],
+        "rarity": card["rarity"] or match["rarity"],
+    }
+
+
 def _remove_orphan_photos(cfg: Settings, db: Database, min_age_s: int = 24 * 3600) -> None:
     """Delete photos from scans that were never saved to the collection."""
     in_use = db.photos_in_use()
@@ -195,14 +215,15 @@ def create_app(
     cfg: Settings | None = None,
     *,
     db: Database | None = None,
-    catalog: catalog_mod.Tcgdex | None = None,
-    recognize: Callable[[bytes], recognizer.Recognition] | None = None,
+    catalog: catalog_mod.Catalog | None = None,
+    read: Callable[[bytes], reader.ReadResult] | None = None,
 ) -> FastAPI:
     cfg = cfg or default_settings
     cfg.photos_dir.mkdir(parents=True, exist_ok=True)
     db = db or Database(cfg.db_path)
     catalog = catalog or catalog_mod.get_catalog()
-    recognize = recognize or recognizer.recognize
+    ocr_available = (lambda: True) if read else reader.tesseract_available
+    read = read or reader.read_card
     refresh_job = RefreshJob()
     _remove_orphan_photos(cfg, db)
 
@@ -233,14 +254,25 @@ def create_app(
             raise HTTPException(404, "Card not found")
         return card
 
-    def lookup_and_describe(read: dict) -> dict:
+    def describe(read_fields: dict, hint: str = "") -> dict:
+        """Look an identifier up and describe the result for the scan screen."""
         match, catalog_error = None, None
+        # The code as read, other readings of it, then the set of the packs being opened.
+        attempts = [(code, True) for code in [read_fields.get("set_code", ""), *read_fields.get("alternatives", ())]]
+        if hint and hint.lower() not in (code.lower() for code, _ in attempts):
+            attempts.append((hint, False))
         try:
-            match = catalog.lookup(name_jp=read.get("name_jp", ""), set_code=read.get("set_code", ""),
-                                   number=read.get("number", ""), finish=read.get("finish") or "normal")
+            for code, from_ocr in attempts:
+                match = catalog.lookup(set_code=code, number=read_fields.get("number", ""),
+                                       total=read_fields.get("total", ""),
+                                       language=read_fields.get("language", ""),
+                                       finish=read_fields.get("finish") or "normal",
+                                       check_total=from_ocr and len(attempts) > 1)
+                if match:
+                    break
         except catalog_mod.CatalogUnavailable:
-            catalog_error = "The card catalogue (TCGdex) could not be reached, so there is no official image or price yet."
-        card = merge_with_match(read, match)
+            catalog_error = "The card catalogue (TCGdex) could not be reached, so there is no name, image or price yet."
+        card = card_from(read_fields, match)
         dup = db.find_duplicate(tcgdex_id=card["tcgdex_id"], set_code=card["set_code"],
                                 number=card["number"], finish=card["finish"])
         return {
@@ -256,18 +288,12 @@ def create_app(
         return card
 
     def link_to_catalog(card: dict) -> dict | None:
-        """Match a card with the catalogue and store the link, image and price. Returns the match."""
-        match = catalog.lookup(name_jp=card["name_jp"], set_code=card["set_code"],
-                               number=card["number"], finish=card["finish"])
+        """Match a saved card with the catalogue and store the link, names, image and price."""
+        match = catalog.lookup(set_code=card["set_code"], number=card["number"], total=card["set_total"],
+                               language=card["language"], finish=card["finish"])
         if not match:
             return None
-        db.update_card(card["id"], {
-            "tcgdex_id": match["tcgdex_id"],
-            "image_url": match["image_url"],
-            "set_name": match["set_name"],
-            "set_total": card["set_total"] or match["set_total"],
-            "rarity": card["rarity"] or match["rarity"],
-        })
+        db.update_card(card["id"], link_fields(card, match))
         if match.get("price"):
             db.set_price(card["id"], match["price"])
         return match
@@ -280,48 +306,52 @@ def create_app(
     @app.get("/api/status")
     def status():
         return {
-            "claude_configured": cfg.claude_configured,
-            "model": cfg.claude_model,
+            "ocr_available": ocr_available(),
+            "card_detection": reader.opencv_available(),
             "language": cfg.card_language,
             "password_protected": bool(cfg.app_password),
         }
 
     @app.post("/api/scan")
-    def scan(file: UploadFile = File(...)):
+    def scan(file: UploadFile = File(...), set_hint: str = Query(default="", max_length=12)):
+        """Read the identifier(s) in a photo and look the card(s) up."""
         raw = file.file.read(MAX_UPLOAD_BYTES + 1)
         if len(raw) > MAX_UPLOAD_BYTES:
             raise HTTPException(413, "Photo is too large (max 25 MB).")
         if not raw:
             raise HTTPException(400, "Empty upload.")
-        if not cfg.claude_configured:
-            raise HTTPException(503, "Card recognition needs a Claude API key: set ANTHROPIC_API_KEY in .env and restart.")
         try:
-            for_claude = recognizer.prepare_image(raw, CLAUDE_IMAGE_SIDE)
-            photo_bytes = recognizer.prepare_image(raw, PHOTO_SIDE)
-        except recognizer.RecognitionError as exc:
+            photo_bytes = reader.prepare_image(raw, PHOTO_SIDE)
+        except reader.ImageError as exc:
             raise HTTPException(400, str(exc)) from exc
-        photo = f"{uuid.uuid4().hex}.jpg"
-        (cfg.photos_dir / photo).write_bytes(photo_bytes)
         try:
-            result = recognize(for_claude)
-        except recognizer.RecognitionError as exc:
-            (cfg.photos_dir / photo).unlink(missing_ok=True)
-            raise HTTPException(502, str(exc)) from exc
-        if not result.cards:
-            (cfg.photos_dir / photo).unlink(missing_ok=True)
-            photo = None
-        cards = []
-        for read in result.cards:
-            entry = lookup_and_describe(read.model_dump())
+            result = read(raw)
+        except reader.ReaderUnavailable as exc:
+            raise HTTPException(503, str(exc)) from exc
+
+        photo = f"{uuid.uuid4().hex}.jpg"
+        (cfg.photos_dir / photo).write_bytes(result.card_image or photo_bytes)
+        hint = set_hint.strip()
+        entries = []
+        for ident in result.identifiers[:MAX_CARDS_PER_PHOTO]:
+            fields = {"set_code": ident.set_code, "alternatives": ident.alternatives, "number": ident.number,
+                      "total": ident.total, "language": ident.language, "rarity": ident.rarity}
+            entry = describe(fields, hint)
+            entry["read"] = ident.label
+            entries.append(entry)
+        # Several reads usually mean misreads of one card: keep the ones found in the catalogue.
+        entries = [e for e in entries if e["matched"]] or entries[:1]
+        for entry in entries:
             entry["card"]["photo"] = photo
-            entry["confidence"] = read.confidence
-            entry["notes"] = read.notes
-            cards.append(entry)
-        return {"photo": photo, "image_problem": result.image_problem, "cards": cards}
+        problem = "" if entries else (
+            "Couldn't read the set code and number in the bottom-left corner. "
+            "Type them in below, or retake the photo closer and without glare."
+        )
+        return {"photo": photo, "problem": problem, "cards": entries}
 
     @app.post("/api/lookup")
     def lookup(req: LookupRequest):
-        return lookup_and_describe(_clean(req.model_dump()))
+        return describe(_clean(req.model_dump()))
 
     @app.get("/api/cards")
     def list_cards(q: str = "", sort: str = "newest", limit: int | None = Query(default=None, ge=1, le=5000)):
@@ -341,8 +371,8 @@ def create_app(
             if data.get("photo") and not existing.get("photo"):
                 card = db.update_card(merge_into, {"photo": data["photo"]})
             return {"action": "merged", "card": with_links(card)}
-        if not (data.get("name_jp") or data.get("name_en")):
-            raise HTTPException(422, "A card needs at least a Japanese or English name.")
+        if not (data.get("name_jp") or data.get("name_en") or (data.get("set_code") and data.get("number"))):
+            raise HTTPException(422, "A card needs a name, or a set code and number.")
         card = db.create_card(data)
         return {"action": "created", "card": with_links(card)}
 
@@ -391,7 +421,7 @@ def create_app(
                     return {"ok": False, "card": with_links(card),
                             "message": "No catalogue match for this card. Check the set code and number."}
                 card = db.get_card(card_id)
-            price = catalog.price_for(card["tcgdex_id"], card["finish"])
+            price = catalog.price_for(card["tcgdex_id"], card["finish"], card["language"])
         except catalog_mod.CatalogUnavailable as exc:
             return {"ok": False, "card": with_links(card), "message": f"Card catalogue unreachable: {exc}"}
         if not price:
@@ -411,9 +441,9 @@ def create_app(
 
     @app.get("/api/export.csv")
     def export_csv():
-        columns = ["id", "name_en", "name_jp", "set_code", "set_name", "number", "set_total", "rarity",
-                   "finish", "quantity", "value", "price_eur", "price_trend", "price_avg30", "price_low",
-                   "manual_price", "price_source", "price_updated_at", "tcgdex_id", "created_at"]
+        columns = ["id", "name_en", "name_jp", "language", "set_code", "set_name", "number", "set_total",
+                   "rarity", "finish", "quantity", "value", "price_eur", "price_trend", "price_avg30",
+                   "price_low", "manual_price", "price_source", "price_updated_at", "tcgdex_id", "created_at"]
         buf = io.StringIO()
         writer = csv.DictWriter(buf, fieldnames=columns, extrasaction="ignore")
         writer.writeheader()

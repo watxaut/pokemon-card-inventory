@@ -1,6 +1,7 @@
 import base64
 import csv
 import io
+import time
 from dataclasses import replace
 
 from starlette.testclient import TestClient
@@ -8,37 +9,60 @@ from starlette.testclient import TestClient
 from app.db import Database
 from app.main import create_app
 
-from .conftest import FakeCatalog, make_jpeg, read_card
+from .conftest import FakeCatalog, ident, make_jpeg
 
 
-def scan(client):
-    return client.post("/api/scan", files={"file": ("card.jpg", make_jpeg(), "image/jpeg")})
+def scan(client, hint=""):
+    return client.post(f"/api/scan?set_hint={hint}", files={"file": ("card.jpg", make_jpeg(), "image/jpeg")})
 
 
-def test_scan_returns_matched_card_with_price_and_saves_photo(client, cfg):
+def test_scan_reads_identifier_and_finds_japanese_card(client, cfg):
     res = scan(client)
     assert res.status_code == 200, res.text
     body = res.json()
-    assert len(body["cards"]) == 1
+    assert body["problem"] == ""
     entry = body["cards"][0]
     assert entry["matched"] is True
-    assert entry["duplicate"] is None
+    assert entry["read"] == "M6 058/076 RR"
     card = entry["card"]
-    assert card["name_jp"] == "ピカチュウ"
-    assert card["name_en"] == "Pikachu"
-    assert card["tcgdex_id"] == "SV2a-025"
-    assert card["set_name"] == "ポケモンカード151"
+    assert (card["name_jp"], card["name_en"]) == ("メガレックウザex", "Mega Rayquaza ex")
+    assert (card["set_code"], card["number"], card["set_total"], card["rarity"]) == ("M6", "058", "076", "RR")
+    assert card["language"] == "ja" and card["tcgdex_id"] == "M6-058"
     assert card["price_eur"] == 1.5
-    assert "cardmarket.com" in entry["cardmarket_search_url"]
     assert (cfg.photos_dir / body["photo"]).is_file()
 
 
-def test_scan_without_cards_reports_problem_and_drops_photo(client, cfg, recognized):
-    recognized.clear()
+def test_scan_english_card_uses_printed_code(client, identifiers):
+    identifiers[:] = [ident("MEG", "179", "132", language="en", rarity="")]
+    card = scan(client).json()["cards"][0]["card"]
+    assert (card["name_en"], card["set_code"], card["language"]) == ("Mega Gardevoir ex", "MEG", "en")
+
+
+def test_unreadable_code_falls_back_to_alternative_then_pack_set(client, identifiers, fake_catalog):
+    identifiers[:] = [ident("GG", alternatives=["M6"])]
+    assert scan(client).json()["cards"][0]["matched"] is True
+    identifiers[:] = [ident("", total="078")]  # code unreadable and set size misread
+    assert scan(client).json()["cards"][0]["matched"] is False
+    assert scan(client, hint="M6").json()["cards"][0]["matched"] is True
+    assert fake_catalog.lookups[-1] == ("M6", "058", "078", False)  # the pack set skips the size check
+
+
+def test_misread_code_with_wrong_set_size_is_rejected(client, identifiers):
+    identifiers[:] = [ident("M6", total="099", alternatives=["XX"])]
+    assert scan(client).json()["cards"][0]["matched"] is False
+
+
+def test_scan_keeps_matched_reads_and_drops_misreads(client, identifiers):
+    identifiers[:] = [ident("M6", number="068"), ident("M6", number="058")]
+    cards = scan(client).json()["cards"]
+    assert [c["card"]["number"] for c in cards] == ["058"]
+
+
+def test_scan_without_identifier_keeps_photo_for_typing(client, cfg, identifiers):
+    identifiers.clear()
     body = scan(client).json()
-    assert body["cards"] == []
-    assert body["photo"] is None
-    assert list(cfg.photos_dir.glob("*.jpg")) == []
+    assert body["cards"] == [] and "Type them in" in body["problem"]
+    assert (cfg.photos_dir / body["photo"]).is_file()
 
 
 def test_scan_rejects_non_images(client):
@@ -46,44 +70,44 @@ def test_scan_rejects_non_images(client):
     assert res.status_code == 400
 
 
-def test_scan_needs_api_key(client, monkeypatch):
-    monkeypatch.delenv("ANTHROPIC_API_KEY")
-    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
-    assert scan(client).status_code == 503
+def test_scan_without_tesseract_explains(cfg, monkeypatch):
+    from app import reader
+    monkeypatch.setattr(reader, "tesseract_available", lambda: False)
+    app = create_app(cfg, db=Database(cfg.db_path), catalog=FakeCatalog())
+    with TestClient(app) as c:
+        assert c.get("/api/status").json()["ocr_available"] is False
+        res = c.post("/api/scan", files={"file": ("card.jpg", make_jpeg(), "image/jpeg")})
+        assert res.status_code == 503 and "Tesseract" in res.json()["detail"]
 
 
-def test_unmatched_card_still_scans(client, recognized):
-    recognized[:] = [read_card(name_jp="リザードン", name_en="Charizard", set_code="SV9", number="999")]
-    entry = scan(client).json()["cards"][0]
-    assert entry["matched"] is False
-    assert entry["card"]["tcgdex_id"] is None
-    assert entry["card"].get("price_eur") is None
+def test_manual_lookup(client):
+    res = client.post("/api/lookup", json={"set_code": "m6", "number": "58"}).json()
+    assert res["matched"] is True and res["card"]["name_en"] == "Mega Rayquaza ex"
+    assert client.post("/api/lookup", json={"set_code": "M6", "number": "999"}).json()["matched"] is False
 
 
 def test_add_then_duplicate_is_detected_and_merged(client):
     entry = scan(client).json()["cards"][0]
     created = client.post("/api/cards", json=entry["card"])
-    assert created.status_code == 201
-    assert created.json()["action"] == "created"
+    assert created.status_code == 201 and created.json()["action"] == "created"
     card_id = created.json()["card"]["id"]
 
     again = scan(client).json()["cards"][0]
     assert again["duplicate"] == {"id": card_id, "quantity": 1}
-
     merged = client.post("/api/cards", json={**again["card"], "merge_into": card_id, "quantity": 2})
-    assert merged.json()["action"] == "merged"
-    assert merged.json()["card"]["quantity"] == 3
+    assert merged.json()["action"] == "merged" and merged.json()["card"]["quantity"] == 3
     assert len(client.get("/api/cards").json()) == 1
 
 
-def test_reverse_holo_is_a_separate_card(client, recognized):
+def test_reverse_holo_is_a_separate_card(client):
     client.post("/api/cards", json=scan(client).json()["cards"][0]["card"])
-    recognized[:] = [read_card(finish="reverse_holo")]
-    assert scan(client).json()["cards"][0]["duplicate"] is None
+    res = client.post("/api/lookup", json={"set_code": "M6", "number": "058", "finish": "reverse_holo"}).json()
+    assert res["duplicate"] is None
 
 
-def test_create_requires_a_name(client):
+def test_create_requires_a_name_or_set_and_number(client):
     assert client.post("/api/cards", json={"set_code": "SV2a"}).status_code == 422
+    assert client.post("/api/cards", json={"set_code": "SV2a", "number": "025"}).status_code == 201
 
 
 def test_ranking_sorts_by_price_and_total_and_manual_price_wins(client):
@@ -91,15 +115,11 @@ def test_ranking_sorts_by_price_and_total_and_manual_price_wins(client):
     pricey = client.post("/api/cards", json={"name_en": "Pricey", "price_eur": 5.0, "quantity": 1}).json()["card"]
     client.post("/api/cards", json={"name_en": "Unpriced"})
 
-    by_value = [c["name_en"] for c in client.get("/api/cards?sort=value").json()]
-    assert by_value == ["Pricey", "Cheap", "Unpriced"]
-    by_total = [c["name_en"] for c in client.get("/api/cards?sort=total").json()]
-    assert by_total == ["Cheap", "Pricey", "Unpriced"]
+    assert [c["name_en"] for c in client.get("/api/cards?sort=value").json()] == ["Pricey", "Cheap", "Unpriced"]
+    assert [c["name_en"] for c in client.get("/api/cards?sort=total").json()] == ["Cheap", "Pricey", "Unpriced"]
 
     client.patch(f"/api/cards/{pricey['id']}", json={"manual_price": 50})
-    stats = client.get("/api/stats").json()
-    assert stats == {"unique_cards": 3, "total_cards": 12, "total_value": 60.0, "priced_cards": 2}
-
+    assert client.get("/api/stats").json() == {"unique_cards": 3, "total_cards": 12, "total_value": 60.0, "priced_cards": 2}
     client.patch(f"/api/cards/{pricey['id']}", json={"manual_price": None})
     assert client.get(f"/api/cards/{pricey['id']}").json()["value"] == 5.0
     assert cheap["value"] == 1.0
@@ -114,8 +134,7 @@ def test_search_matches_japanese_and_english(client):
 
 
 def test_quantity_and_delete(client, cfg):
-    entry = scan(client).json()["cards"][0]
-    card = client.post("/api/cards", json=entry["card"]).json()["card"]
+    card = client.post("/api/cards", json=scan(client).json()["cards"][0]["card"]).json()["card"]
     assert client.post(f"/api/cards/{card['id']}/quantity?delta=2").json()["quantity"] == 3
     assert client.post(f"/api/cards/{card['id']}/quantity?delta=-5").json()["quantity"] == 0
     photo = cfg.photos_dir / card["photo"]
@@ -130,18 +149,18 @@ def test_price_refresh_records_history(client, fake_catalog):
     fake_catalog.price["price_eur"] = 2.25
     res = client.post(f"/api/cards/{card['id']}/price").json()
     assert res["ok"] and res["card"]["price_eur"] == 2.25
-    history = client.get(f"/api/cards/{card['id']}").json()["history"]
-    assert [h["price_eur"] for h in history] == [1.5, 2.25]
+    assert [h["price_eur"] for h in client.get(f"/api/cards/{card['id']}").json()["history"]] == [1.5, 2.25]
 
 
 def test_price_refresh_links_unlinked_card_first(client):
-    card = client.post("/api/cards", json={"name_jp": "ピカチュウ", "set_code": "SV2a", "number": "025"}).json()["card"]
+    card = client.post("/api/cards", json={"set_code": "M6", "number": "058"}).json()["card"]
     assert card["tcgdex_id"] is None
     res = client.post(f"/api/cards/{card['id']}/price").json()
-    assert res["ok"] and res["card"]["tcgdex_id"] == "SV2a-025" and res["card"]["price_eur"] == 1.5
+    assert res["ok"] and res["card"]["tcgdex_id"] == "M6-058" and res["card"]["price_eur"] == 1.5
+    assert res["card"]["name_en"] == "Mega Rayquaza ex"  # names filled in from the catalogue
 
 
-def test_price_refresh_without_catalogue_price_explains_what_to_do(client):
+def test_price_refresh_without_match_explains_what_to_do(client):
     card = client.post("/api/cards", json={"name_jp": "ミュウ", "name_en": "Mew"}).json()["card"]
     res = client.post(f"/api/cards/{card['id']}/price").json()
     assert res["ok"] is False and "set code" in res["message"]
@@ -152,54 +171,45 @@ def test_manual_price_entered_when_adding(client):
     assert card["value"] == 4.2 and card["price_eur"] is None
 
 
-def test_ai_price_search_is_gone(client):
-    assert "ai_price_search" not in client.get("/api/status").json()
-    assert all("ai" not in route.path.split("/") for route in client.app.routes)
+def test_no_claude_anywhere(client):
+    status = client.get("/api/status").json()
+    assert set(status) == {"ocr_available", "card_detection", "language", "password_protected"}
 
 
 def test_rematch_links_card_after_fixing_number(client):
-    card = client.post("/api/cards", json={"name_jp": "ピカチュウ", "set_code": "SV2a", "number": "52"}).json()["card"]
+    card = client.post("/api/cards", json={"set_code": "M6", "number": "52"}).json()["card"]
     assert client.post(f"/api/cards/{card['id']}/rematch").json()["matched"] is False
-    client.patch(f"/api/cards/{card['id']}", json={"number": "025"})
+    client.patch(f"/api/cards/{card['id']}", json={"number": "058"})
     res = client.post(f"/api/cards/{card['id']}/rematch").json()
-    assert res["matched"] is True
-    assert res["card"]["tcgdex_id"] == "SV2a-025"
-    assert res["card"]["price_eur"] == 1.5
+    assert res["matched"] is True and res["card"]["tcgdex_id"] == "M6-058" and res["card"]["price_eur"] == 1.5
 
 
 def test_bulk_refresh_links_and_prices(client):
-    client.post("/api/cards", json={"name_jp": "ピカチュウ", "set_code": "SV2a", "number": "025"})
-    client.post("/api/cards", json={"name_jp": "ミュウ", "set_code": "SV2a", "number": "151"})
+    client.post("/api/cards", json={"set_code": "M6", "number": "058"})
+    client.post("/api/cards", json={"name_jp": "ミュウ", "set_code": "M6", "number": "151"})
     assert client.post("/api/prices/refresh").json()["started"] is True
     for _ in range(100):
         status = client.get("/api/prices/refresh").json()
         if not status["running"]:
             break
-        import time
         time.sleep(0.05)
     assert status["updated"] == 1 and status["no_price"] == 1 and status["errors"] == 0
-    prices = sorted((c["name_jp"], c["price_eur"]) for c in client.get("/api/cards").json())
-    assert prices == [("ピカチュウ", 1.5), ("ミュウ", None)]
-
-
-def test_lookup_endpoint(client):
-    res = client.post("/api/lookup", json={"name_jp": "ピカチュウ", "set_code": "sv2a", "number": "25"}).json()
-    assert res["matched"] is True and res["card"]["image_url"].endswith("high.webp")
+    prices = sorted((c["number"], c["price_eur"]) for c in client.get("/api/cards").json())
+    assert prices == [("058", 1.5), ("151", None)]
 
 
 def test_csv_export_has_bom_and_japanese(client):
     client.post("/api/cards", json={"name_jp": "ピカチュウ", "name_en": "Pikachu", "price_eur": 1.5})
     res = client.get("/api/export.csv")
-    assert res.status_code == 200
     text = res.content.decode("utf-8")
-    assert text.startswith("﻿")
+    assert res.status_code == 200 and text.startswith("﻿")
     rows = list(csv.DictReader(io.StringIO(text.lstrip("﻿"))))
     assert rows[0]["name_jp"] == "ピカチュウ" and rows[0]["value"] == "1.5"
 
 
 def test_password_protection(cfg):
     locked = replace(cfg, app_password="s3cret")
-    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(), recognize=lambda b: None)
+    app = create_app(locked, db=Database(locked.db_path), catalog=FakeCatalog(), read=lambda b: None)
     with TestClient(app) as c:
         assert c.get("/api/cards").status_code == 401
         assert c.get("/").status_code == 401
@@ -212,16 +222,14 @@ def test_password_protection(cfg):
 def test_index_and_static_served(client):
     assert "Card Binder" in client.get("/").text
     assert client.get("/static/app.js").status_code == 200
-    assert client.get("/api/status").json()["claude_configured"] is True
+    assert client.get("/api/status").json()["ocr_available"] is True
 
 
 def test_rejects_unsafe_photo_names_and_links(client, cfg):
     (cfg.data_dir / "keep.txt").write_text("important")
-    bad_photo = client.post("/api/cards", json={"name_en": "X", "photo": "../keep.txt"})
-    assert bad_photo.status_code == 422
+    assert client.post("/api/cards", json={"name_en": "X", "photo": "../keep.txt"}).status_code == 422
     assert (cfg.data_dir / "keep.txt").exists()
-    bad_link = client.post("/api/cards", json={"name_en": "X", "cardmarket_url": "javascript:alert(1)"})
-    assert bad_link.status_code == 422
+    assert client.post("/api/cards", json={"name_en": "X", "cardmarket_url": "javascript:alert(1)"}).status_code == 422
     card = client.post("/api/cards", json={"name_en": "X"}).json()["card"]
     assert client.patch(f"/api/cards/{card['id']}", json={"cardmarket_url": "data:text/html,hi"}).status_code == 422
     ok = client.patch(f"/api/cards/{card['id']}",

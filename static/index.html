@@ -51,7 +51,23 @@
             <input type="checkbox" id="quick-mode">
             <span>Quick add: save clearly-read cards straight away (with undo)</span>
           </label>
-          <p class="hint">Tip: one card per photo, flat, in good light, with the bottom-left set code and number in focus.</p>
+          <p class="hint">Tip: one card per photo, upright and filling the frame, with the bottom-left code
+            (e.g. <code>M6 058/076</code>) sharp and free of glare.</p>
+
+          <div class="pack-box">
+            <label class="pack-set">Set of the packs you're opening
+              <input id="pack-set" type="text" placeholder="e.g. M6" maxlength="12" autocapitalize="characters"
+                     autocomplete="off" spellcheck="false">
+            </label>
+            <p class="hint">Filled in from the first card found. Used when a set code can't be read.</p>
+            <form id="manual-form" class="manual-form">
+              <label>Type a card number
+                <input id="manual-number" type="text" placeholder="058  (or 179/132)" maxlength="9"
+                       inputmode="numeric" autocomplete="off">
+              </label>
+              <button class="btn" type="submit">Find card</button>
+            </form>
+          </div>
 
           <div id="scan-status" class="scan-status" aria-live="polite"></div>
         </div>

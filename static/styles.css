@@ -302,3 +302,13 @@ details summary { cursor: pointer; color: var(--text-2); font-weight: 600; font-
 }
 .toast button { background: transparent; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; }
 .toast.error { background: var(--accent); color: var(--accent-ink); }
+
+/* ------------------------------------------------------- pack set / manual */
+.pack-box {
+  margin-top: 14px; padding: 12px 14px; border-radius: var(--radius);
+  background: var(--surface); border: 1px solid var(--border); display: grid; gap: 8px;
+}
+.pack-box label { display: grid; gap: 4px; font-size: 0.8rem; font-weight: 600; color: var(--text-2); }
+.pack-box .hint { margin: 0; }
+.manual-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85em; }

@@ -81,7 +81,19 @@ function cardImage(card) {
 }
 
 function displayName(card) {
-  return card.name_en || card.name_jp || "Unknown card";
+  if (card.name_en || card.name_jp) return card.name_en || card.name_jp;
+  return card.set_code && card.number ? `${card.set_code} ${card.number}` : "Unknown card";
+}
+
+/* The set of the packs being opened: used when OCR can't read a set code, and for typed numbers. */
+function packSet() {
+  return $("#pack-set").value.trim();
+}
+
+function rememberPackSet(code) {
+  if (!code || packSet()) return;
+  $("#pack-set").value = code;
+  try { localStorage.setItem("packSet", code); } catch { /* ignore */ }
 }
 
 function setLine(card) {
@@ -117,9 +129,10 @@ async function loadStatus() {
     state.status = null;
   }
   const banner = $("#setup-banner");
-  if (state.status && !state.status.claude_configured) {
+  if (state.status && !state.status.ocr_available) {
     banner.hidden = false;
-    banner.textContent = "Card recognition is off: add your ANTHROPIC_API_KEY to the .env file and restart the server. You can still browse your collection.";
+    banner.textContent = "Reading cards from photos is off because Tesseract isn't installed (see the README) — "
+      + "you can still type the card number below.";
   }
 }
 
@@ -164,10 +177,21 @@ function stopCamera() {
 function captureFrame() {
   const video = $("#video");
   if (!video.videoWidth) return;
+  // Keep only the area inside the on-screen card frame (plus a margin), so the card fills the photo.
+  const box = video.getBoundingClientRect();
+  const guide = $(".card-guide").getBoundingClientRect();
+  const scale = Math.max(box.width / video.videoWidth, box.height / video.videoHeight); // object-fit: cover
+  const offX = (video.videoWidth * scale - box.width) / 2;
+  const offY = (video.videoHeight * scale - box.height) / 2;
+  const margin = 0.08 * guide.height;
+  const sx = Math.max(0, (guide.left - box.left - margin + offX) / scale);
+  const sy = Math.max(0, (guide.top - box.top - margin + offY) / scale);
+  const sw = Math.min(video.videoWidth - sx, (guide.width + 2 * margin) / scale);
+  const sh = Math.min(video.videoHeight - sy, (guide.height + 2 * margin) / scale);
   const canvas = document.createElement("canvas");
-  canvas.width = video.videoWidth;
-  canvas.height = video.videoHeight;
-  canvas.getContext("2d").drawImage(video, 0, 0);
+  canvas.width = Math.round(sw);
+  canvas.height = Math.round(sh);
+  canvas.getContext("2d").drawImage(video, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
   canvas.toBlob((blob) => enqueue([new File([blob], "capture.jpg", { type: "image/jpeg" })]), "image/jpeg", 0.92);
 }
 
@@ -188,9 +212,9 @@ async function processQueue() {
     try {
       const form = new FormData();
       form.append("file", file);
-      const result = await api("/api/scan", { method: "POST", body: form });
-      await handleScanResult(result);
-      setScanStatus("");
+      const result = await api(`/api/scan?set_hint=${encodeURIComponent(packSet())}`, { method: "POST", body: form });
+      const keepMessage = await handleScanResult(result);
+      if (!keepMessage) setScanStatus("");
     } catch (e) {
       setScanStatus(e.message, false, true);
     }
@@ -205,13 +229,16 @@ function setScanStatus(message, spinning = false, error = false) {
 }
 
 async function handleScanResult(result) {
+  state.lastPhoto = { name: result.photo, at: Date.now() };  // attach it if the number is typed in next
   if (!result.cards.length) {
-    setScanStatus(result.image_problem || "No card found in that photo.", false, true);
-    return;
+    setScanStatus(result.problem || "No card number found in that photo.", false, true);
+    $("#manual-number").focus();
+    return true;  // keep the message on screen
   }
   const quick = $("#quick-mode").checked;
   for (const entry of result.cards.slice().reverse()) {
-    if (quick && entry.confidence === "high" && entry.matched) {
+    if (entry.matched) rememberPackSet(entry.card.set_code);
+    if (quick && entry.matched) {
       try {
         await saveCard(entry, entry.duplicate ? entry.duplicate.id : null);
         continue;
@@ -221,7 +248,33 @@ async function handleScanResult(result) {
     }
     $("#scan-results").prepend(renderResult(entry));
   }
-  if (result.image_problem) toast(result.image_problem);
+}
+
+/* Typed-in number (when the photo can't be read): "058", or "179/132" for English cards. */
+async function manualLookup(ev) {
+  ev.preventDefault();
+  const raw = $("#manual-number").value.trim();
+  const set = packSet();
+  if (!raw) return;
+  if (!set) {
+    toast("Enter the set code of your packs first (e.g. M6 or MEG).", { error: true });
+    $("#pack-set").focus();
+    return;
+  }
+  const [number, total = ""] = raw.split("/").map((s) => s.trim());
+  try {
+    const entry = await api("/api/lookup", { method: "POST", json: { set_code: set, number, total } });
+    const recent = state.lastPhoto && Date.now() - state.lastPhoto.at < 10 * 60 * 1000;
+    if (recent && state.lastPhoto.name) entry.card.photo = state.lastPhoto.name;
+    state.lastPhoto = null;
+    entry.read = "typed in";
+    if (!entry.matched) toast(`No card ${number} found in set ${set}. Check the set code and number.`, { error: true });
+    $("#scan-results").prepend(renderResult(entry));
+    $("#manual-number").value = "";
+    setScanStatus("");
+  } catch (e) {
+    toast(e.message, { error: true });
+  }
 }
 
 function renderResult(entry) {
@@ -243,8 +296,7 @@ function renderResult(entry) {
           <span class="jp muted" lang="ja">${esc(card.name_jp)}</span>
         </div>
         <div class="badges">
-          <span class="badge ${entry.confidence === "high" ? "good" : entry.confidence === "low" ? "accent" : "warn"}">
-            ${esc(entry.confidence || "manual")} confidence</span>
+          ${entry.read ? `<span class="badge">Read: ${esc(entry.read)}</span>` : ""}
           ${entry.matched ? `<span class="badge good">Found in catalogue${card.set_name ? `: ${esc(card.set_name)}` : ""}</span>`
                           : `<span class="badge warn">Not matched in catalogue</span>`}
           ${dup ? `<span class="badge accent">You already have ×${dup.quantity}</span>` : ""}
@@ -268,7 +320,7 @@ function renderResult(entry) {
           <a class="small" href="${esc(entry.cardmarket_search_url)}" target="_blank" rel="noopener">Check on Cardmarket ↗</a>
         </div>
         ${entry.catalog_error ? `<p class="notes">${esc(entry.catalog_error)}</p>` : ""}
-        ${entry.notes ? `<p class="notes">Note: ${esc(entry.notes)}</p>` : ""}
+        ${entry.matched ? "" : `<p class="notes">Fix the set code or number above and press Re-match, or type a name and add it as it is.</p>`}
         <div class="actions">
           ${dup ? `<button class="btn primary" data-act="merge">Add copy (have ×${dup.quantity})</button>
                    <button class="btn" data-act="new">Save as separate card</button>`
@@ -298,7 +350,9 @@ function renderResult(entry) {
     btn.disabled = true;
     try {
       if (act === "rematch") {
-        const fresh = await api("/api/lookup", { method: "POST", json: card });
+        const fresh = await api("/api/lookup", { method: "POST", json: {
+          set_code: card.set_code, number: card.number, total: card.set_total || "", finish: card.finish,
+        } });
         const keep = { photo: card.photo, quantity: card.quantity };
         for (const key of Object.keys(card)) if (key.startsWith("price_")) delete card[key];
         Object.assign(card, fresh.card, keep);
@@ -598,6 +652,12 @@ function init() {
   quick.addEventListener("change", () => {
     try { localStorage.setItem("quick", quick.checked ? "1" : "0"); } catch { /* ignore */ }
   });
+  const pack = $("#pack-set");
+  try { pack.value = localStorage.getItem("packSet") || ""; } catch { /* ignore */ }
+  pack.addEventListener("change", () => {
+    try { localStorage.setItem("packSet", pack.value.trim()); } catch { /* ignore */ }
+  });
+  $("#manual-form").addEventListener("submit", manualLookup);
 
   $("#session-log").addEventListener("click", (ev) => {
     const btn = ev.target.closest("button[data-undo]");

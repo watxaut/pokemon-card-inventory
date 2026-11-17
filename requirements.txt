@@ -1,6 +1,9 @@
-anthropic>=2.8,<3
 fastapi>=0.163
 uvicorn>=0.54
 python-multipart>=0.0.30
 pillow>=9.1
 httpx2>=2.13
+pytesseract>=0.3.10
+# Optional but recommended on laptops: finds and straightens the card in the photo
+# before reading it. Leave it out on phones (termux-setup.sh skips it).
+opencv-python-headless>=4.8

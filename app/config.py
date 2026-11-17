@@ -26,11 +26,10 @@ def _load_dotenv(path: Path) -> None:
 @dataclass(frozen=True)
 class Settings:
     data_dir: Path
-    claude_model: str
-    claude_effort: str
     app_password: str
     tcgdex_base_url: str
     card_language: str
+    tesseract_cmd: str
 
     @property
     def db_path(self) -> Path:
@@ -40,10 +39,6 @@ class Settings:
     def photos_dir(self) -> Path:
         return self.data_dir / "photos"
 
-    @property
-    def claude_configured(self) -> bool:
-        return bool(os.getenv("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_AUTH_TOKEN"))
-
 
 def load_settings() -> Settings:
     _load_dotenv(BASE_DIR / ".env")
@@ -52,11 +47,10 @@ def load_settings() -> Settings:
         data_dir = (BASE_DIR / data_dir).resolve()
     return Settings(
         data_dir=data_dir,
-        claude_model=os.getenv("CLAUDE_MODEL") or "claude-opus-5-5",
-        claude_effort=os.getenv("CLAUDE_EFFORT") or "medium",
         app_password=os.getenv("APP_PASSWORD") or "",
         tcgdex_base_url=(os.getenv("TCGDEX_BASE_URL") or "https://api.tcgdex.net/v2").rstrip("/"),
         card_language=os.getenv("CARD_LANGUAGE") or "ja",
+        tesseract_cmd=os.getenv("TESSERACT_CMD") or "",
     )
 
 
