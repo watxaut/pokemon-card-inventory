@@ -12,7 +12,7 @@ with a SQLite file, and it can run on an
 [Android phone](#run-it-on-an-android-phone-termux).
 
 ```
- browser (phone / laptop)                          python run.py (laptop or phone)
+ browser (phone / laptop)                          uv run run.py (laptop or phone)
 ┌───────────────────────────────┐  card   ┌───────────────────────────────────────────┐
 │ camera: find the card live,   │  image  │ Tesseract: read "M6 058/076" in the        │
 │ outline it, straighten it     │ ──────▶ │   bottom-left strip                        │
@@ -51,7 +51,7 @@ with a SQLite file, and it can run on an
    the matched card's name. A match confirms the card. If another reading's card matches
    instead, that one is used. If nothing matches, the name is looked up in the likely sets,
    which finds the card even when the number was misread. This needs the Japanese model:
-   `python scripts/get_jpn_model.py` (about 14 MB, done by the Termux setup).
+   `uv run scripts/get_jpn_model.py` (about 14 MB, done by the Termux setup).
 
 Uncertain reads are marked **Please check the number**, other readings that are also real
 cards are offered as one-tap alternatives, and **Quick add** only saves confident reads.
@@ -110,22 +110,21 @@ TCGdex is the source. Japanese cards often have no price there. In that case, ta
 | Android (Termux) | done by `termux-setup.sh` (`pkg install tesseract`) |
 
 The English data (included) reads the code. For the name check on Japanese cards, also run
-`python scripts/get_jpn_model.py` once: it downloads Tesseract's accurate Japanese model into
+`uv run scripts/get_jpn_model.py` once: it downloads Tesseract's accurate Japanese model into
 `./tessdata` (about 14 MB). The `jpn` language from your package manager works too, but is
 less accurate.
 
 ## Quick start (laptop)
 
-You need Python 3.10+ and Tesseract.
+You need [uv](https://docs.astral.sh/uv/getting-started/installation/) and Tesseract. uv
+installs Python 3.11+ for you if needed.
 
 ```bash
 git clone <this repo> && cd pokemon-card-inventory
-python -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+uv sync                            # creates .venv and installs the locked packages
 cp .env.example .env               # optional: password, data folder
-python scripts/get_jpn_model.py    # optional: name check for Japanese cards
-python run.py
+uv run scripts/get_jpn_model.py    # optional: name check for Japanese cards
+uv run run.py
 ```
 
 `run.py` prints the addresses to open:
@@ -174,7 +173,8 @@ The whole app runs on the phone, with no internet needed except for the card dat
    works here, because the browser treats `localhost` as secure.
 
 If the compile step fails, run
-`source .venv/bin/activate && CARGO_BUILD_TARGET=aarch64-linux-android python -m pip install -r requirements.txt`.
+`bash termux-setup.sh` again with `CARGO_BUILD_TARGET=aarch64-linux-android` set:
+`CARGO_BUILD_TARGET=aarch64-linux-android bash termux-setup.sh`.
 If it still fails, keep the error message to ask for help.
 
 **Keeping it safe on the phone**
@@ -273,10 +273,10 @@ folder.
 ## Development
 
 ```bash
-pip install -r requirements-dev.txt
-python -m pytest -q          # OCR tests run for real when Tesseract is installed
-python run.py --reload
-python scripts/build_names.py   # refresh the Japanese→English name list from PokeAPI
+uv sync                      # includes the dev group (pytest) by default
+uv run pytest -q             # OCR tests run for real when Tesseract is installed
+uv run run.py --reload
+uv run scripts/build_names.py   # refresh the Japanese→English name list from PokeAPI
 ```
 
 ```

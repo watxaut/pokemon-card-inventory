@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Start Card Binder and print the addresses to open on this computer and on your phone.
 
-    python run.py                 # http://localhost:8000 + your Wi-Fi address
-    python run.py --port 9000
-    python run.py --ssl-certfile cert.pem --ssl-keyfile key.pem   # HTTPS (live camera on phones)
+    uv run run.py                 # http://localhost:8000 + your Wi-Fi address
+    uv run run.py --port 9000
+    uv run run.py --ssl-certfile cert.pem --ssl-keyfile key.pem   # HTTPS (live camera on phones)
 """
 
 from __future__ import annotations
@@ -65,7 +65,7 @@ def main() -> None:
         print("\n  ! Tesseract is not installed: photos can't be read until you install it (see README).")
         print("    You can still type card numbers in.")
     elif not reader.title_available():
-        print("  Card names are not checked: run 'python scripts/get_jpn_model.py' to enable it.")
+        print("  Card names are not checked: run 'uv run scripts/get_jpn_model.py' to enable it.")
     if settings.app_password:
         print("  Password protection is ON (APP_PASSWORD).")
     print()

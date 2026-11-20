@@ -40,8 +40,10 @@ python -m venv --system-site-packages --without-pip .venv
 source .venv/bin/activate
 ANDROID_API_LEVEL="$(getprop ro.build.version.sdk)"
 export ANDROID_API_LEVEL
+# Termux keeps pip (not uv) so the venv can reuse its prebuilt packages. The package list
+# comes from pyproject.toml; numpy comes prebuilt from pkg (above).
 requirements="$(mktemp)"
-grep -v -i '^numpy' requirements.txt > "${requirements}"  # numpy comes prebuilt from pkg (above)
+python -c "import tomllib; deps = tomllib.load(open('pyproject.toml', 'rb'))['project']['dependencies']; print('\n'.join(d for d in deps if not d.lower().startswith('numpy')))" > "${requirements}"
 if command -v termux-wake-lock > /dev/null; then termux-wake-lock || true; fi
 python -m pip install -r "${requirements}"
 if command -v termux-wake-unlock > /dev/null; then termux-wake-unlock || true; fi

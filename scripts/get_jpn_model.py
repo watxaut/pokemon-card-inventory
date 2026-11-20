@@ -4,7 +4,7 @@
 Used to read card names, as a cross-check of the number (Japanese cards only). The app
 works without it, but then skips the name check.
 
-    python scripts/get_jpn_model.py
+    uv run scripts/get_jpn_model.py
 """
 
 from __future__ import annotations

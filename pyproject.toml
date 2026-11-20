@@ -1,0 +1,23 @@
+[project]
+name = "pokemon-card-inventory"
+version = "0.1.0"
+description = "Card Binder: Pokémon card inventory (Japanese and English) with on-device OCR"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.163",
+    "uvicorn>=0.54",
+    "python-multipart>=0.0.30",
+    "pillow>=9.1",
+    "httpx2>=2.13",
+    "pytesseract>=0.3.10",
+    "numpy>=1.24",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9",
+]
+
+[tool.uv]
+package = false

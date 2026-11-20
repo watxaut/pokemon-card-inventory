@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Rebuild app/data/names.json (Japanese -> English Pokémon and item names) from PokeAPI.
 
-    python scripts/build_names.py            # downloads the CSVs from GitHub
-    python scripts/build_names.py CSV_DIR    # or reads pokemon_species_names.csv / item_names.csv from a folder
+    uv run scripts/build_names.py            # downloads the CSVs from GitHub
+    uv run scripts/build_names.py CSV_DIR    # or reads pokemon_species_names.csv / item_names.csv from a folder
 
 Data: https://github.com/PokeAPI/pokeapi (BSD-3-Clause). Run again when new Pokémon are released.
 """
